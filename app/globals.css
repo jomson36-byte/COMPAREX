@@ -1,0 +1,350 @@
+:root {
+  color-scheme: dark;
+  background: #050505;
+  color: #f3f3f3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Arial, Helvetica, sans-serif;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(126, 161, 255, 0.14), transparent 34rem),
+    radial-gradient(circle at 88% 12%, rgba(39, 197, 157, 0.11), transparent 28rem),
+    #050505;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  min-height: 2.75rem;
+  border: 1px solid #3b3b3b;
+  border-radius: 8px;
+  padding: 0 1rem;
+  color: #f8f8f8;
+  background: #181818;
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+button:hover:not(:disabled) {
+  border-color: #777;
+  background: #242424;
+  transform: translateY(-1px);
+}
+
+button:disabled {
+  color: #666;
+  cursor: not-allowed;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 52px;
+  border-bottom: 1px solid #202020;
+  padding: 0 18px;
+  margin-bottom: 0;
+  background: rgba(5, 5, 5, 0.82);
+}
+
+.topbar p {
+  margin: 0 0 6px;
+  color: #9a9a9a;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.topbar h1 {
+  margin: 0;
+  color: #ffffff;
+  font-size: 1.05rem;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #333;
+  border-radius: 999px;
+  min-height: 2.25rem;
+  padding: 0 0.85rem;
+  color: #d9d9d9;
+  background: rgba(255, 255, 255, 0.04);
+  white-space: nowrap;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  height: calc(100vh - 52px);
+  min-height: calc(100vh - 52px);
+  overflow: hidden;
+}
+
+.drop-panel {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  background: rgba(10, 10, 10, 0.78);
+}
+
+.drop-panel + .drop-panel {
+  border-left: 1px solid #272727;
+}
+
+.clear-file-button {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 5;
+  flex: 0 0 auto;
+  width: 1.8rem;
+  height: 1.8rem;
+  min-height: 1.8rem;
+  border-color: rgba(255, 143, 143, 0.35);
+  padding: 0;
+  color: #ffb8b8;
+  background: rgba(255, 105, 105, 0.08);
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.clear-file-button:hover {
+  border-color: rgba(255, 143, 143, 0.72);
+  background: rgba(255, 105, 105, 0.18);
+}
+
+.drop-zone {
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.015)),
+    #0b0b0b;
+  outline: none;
+  transition:
+    border-color 180ms ease,
+    background 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.drop-zone:focus-visible,
+.drop-zone.dragging {
+  box-shadow: inset 0 0 0 2px rgba(134, 247, 209, 0.72);
+}
+
+.drop-zone.has-file {
+  background: #0b0b0b;
+}
+
+.empty-state,
+.file-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  text-align: center;
+}
+
+.empty-state strong {
+  font-size: clamp(1.2rem, 2.2vw, 2rem);
+  letter-spacing: 0;
+}
+
+.empty-state span,
+.file-details span {
+  color: #969696;
+}
+
+.upload-mark,
+.file-icon {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  border: 1px solid #3b3b3b;
+  border-radius: 8px;
+  color: #ffffff;
+  background: #151515;
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.file-icon {
+  width: 84px;
+  color: #86f7d1;
+  font-size: 1rem;
+}
+
+.file-details {
+  display: grid;
+  gap: 8px;
+  max-width: min(100%, 520px);
+}
+
+.file-details strong {
+  overflow-wrap: anywhere;
+  font-size: clamp(1rem, 1.6vw, 1.35rem);
+  line-height: 1.25;
+}
+
+.docx-note {
+  max-width: 320px;
+  color: #b9b9b9;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.pdf-preview {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 2rem;
+}
+
+.preview-toolbar button {
+  min-height: 2rem;
+  padding: 0 0.72rem;
+  font-size: 0.82rem;
+}
+
+.preview-toolbar span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 4.4rem;
+  min-height: 2rem;
+  border: 1px solid #2d2d2d;
+  border-radius: 8px;
+  color: #d7d7d7;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.82rem;
+}
+
+.pdf-canvas-wrap {
+  position: relative;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #242424;
+  border-radius: 8px;
+  padding: 16px;
+  background: #111;
+}
+
+.pdf-pages {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  min-height: 100%;
+}
+
+.pdf-pages canvas {
+  display: block;
+  max-width: none;
+  height: auto;
+  background: #fff;
+  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.42);
+}
+
+.preview-status {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  color: #bdbdbd;
+  transform: translate(-50%, -50%);
+}
+
+.error-message {
+  margin: 12px 0 0;
+  color: #ff8f8f;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 820px) {
+  .topbar {
+    align-items: center;
+    flex-direction: row;
+  }
+
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .drop-panel {
+    min-height: 0;
+  }
+
+  .drop-panel + .drop-panel {
+    border-top: 1px solid #272727;
+    border-left: 0;
+  }
+
+  .drop-zone {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .preview-toolbar {
+    justify-content: flex-start;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+}
