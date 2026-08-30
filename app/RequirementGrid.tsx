@@ -33,6 +33,7 @@ export type RequirementGridRow =
 
 type Props = {
   rows: RequirementGridRow[];
+  showStartHint: boolean;
   onJump: (mark: EvidenceMark) => void;
   onUnlink: (mark: EvidenceMark) => void;
   onDropEvidence: (requirement: EvidenceMark, evidenceId: string) => void;
@@ -62,8 +63,27 @@ const textCell = (data: string, themeOverride?: GridCell["themeOverride"]): Grid
   themeOverride,
 });
 
+const sourceCell = (mark: EvidenceMark, fallback: string): GridCell => {
+  if (!mark.fileUrl) return textCell(fallback, { textDark: "#64748b" });
+
+  return {
+    kind: GridCellKind.Uri,
+    allowOverlay: false,
+    readonly: true,
+    data: mark.fileUrl,
+    displayData: mark.fileName,
+    hoverEffect: true,
+    themeOverride: { linkColor: "#5eead4" },
+    onClickUri: ({ preventDefault }) => {
+      preventDefault();
+      window.open(mark.fileUrl, "_blank", "noopener,noreferrer");
+    },
+  };
+};
+
 export default function RequirementGrid({
   rows,
+  showStartHint,
   onJump,
   onUnlink,
   onDropEvidence,
@@ -154,12 +174,9 @@ export default function RequirementGrid({
           }
           return textCell("Unassigned evidence", { textDark: "#94a3b8" });
         case 2:
-          return textCell(
-            isRequirement
-              ? row.mark.manual
-                ? "Manual"
-                : `TOR · p.${row.mark.page}`
-              : `Evidence · p.${row.mark.page}`,
+          return sourceCell(
+            row.mark,
+            row.mark.manual ? "Manual" : row.mark.fileName,
           );
         case 3:
           return textCell(evidenceSummary || "Drop evidence here", {
@@ -341,7 +358,6 @@ export default function RequirementGrid({
             return;
           }
           event.setData("application/x-comparex-evidence", row.mark.id);
-          event.setData("text/plain", row.mark.text);
         }}
         onDragOverCell={(_, transfer) => {
           if (transfer?.types.includes("application/x-comparex-evidence")) {
@@ -380,6 +396,11 @@ export default function RequirementGrid({
           headerFontStyle: "600 11px",
         }}
       />
+      {showStartHint ? (
+        <p className="requirement-grid-empty-hint" role="status">
+          Highlight a TOR section or add a requirement to begin.
+        </p>
+      ) : null}
       {selected?.kind === "requirement" && selected.evidence.length ? (
         <div className="grid-selection-detail">
           <strong>{selected.path} · Linked evidence</strong>

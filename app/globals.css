@@ -291,6 +291,7 @@ button:disabled {
 }
 
 .catalog-quick-add:focus-visible,
+.catalog-print-button:focus-visible,
 .catalog-switcher summary:focus-visible {
   outline: 2px solid #3b82f6;
   outline-offset: 1px;
@@ -366,7 +367,8 @@ button:disabled {
 
 .catalog-popover-heading button,
 .catalog-row-remove,
-.catalog-quick-add {
+.catalog-quick-add,
+.catalog-print-button {
   display: inline-grid;
   place-items: center;
   width: 32px;
@@ -472,6 +474,19 @@ button:disabled {
   border-color: #475569;
   color: #dbeafe;
   background: #1e293b;
+}
+
+.catalog-print-button {
+  flex: 0 0 auto;
+  border-color: #475569;
+  color: #bfdbfe;
+  background: #0f172a;
+}
+
+.catalog-print-button:hover:not(:disabled) {
+  border-color: #3b82f6;
+  color: #eff6ff;
+  background: #1e3a8a;
 }
 
 .panel-splitter {
@@ -684,6 +699,13 @@ button:disabled {
   pointer-events: none;
 }
 
+.page-annotation-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  pointer-events: none;
+}
+
 .area-highlight {
   position: absolute;
   z-index: 12;
@@ -695,6 +717,26 @@ button:disabled {
 .area-highlight-draft.catalog {
   border-color: #3b82f6;
   background: rgb(59 130 246 / 23%);
+}
+
+.requirement-reference-badge {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 13;
+  border: 1px solid #1d4ed8;
+  border-radius: 0;
+  padding: 1px 5px;
+  color: #eff6ff;
+  background: #1d4ed8;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.25;
+  pointer-events: none;
+  transform: translateY(-100%);
+  transform-origin: left bottom;
+  white-space: nowrap;
 }
 
 .area-highlight-draft {
@@ -888,6 +930,7 @@ button:disabled {
 }
 
 .glide-requirement-grid {
+  position: relative;
   flex: 1 0 auto;
   min-width: 0;
   overflow: hidden;
@@ -898,6 +941,22 @@ button:disabled {
 
 .glide-requirement-grid > div:first-child {
   min-width: 0;
+}
+
+.requirement-grid-empty-hint {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  right: 24px;
+  left: 24px;
+  margin: 0;
+  padding: 0 16px;
+  color: #94a3b8;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  pointer-events: none;
+  text-align: center;
+  transform: translateY(-50%);
 }
 
 .requirement-grid-actions {

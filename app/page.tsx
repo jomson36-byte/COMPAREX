@@ -24,12 +24,14 @@ import {
   Pin,
   PinOff,
   Plus,
+  Printer,
   ShieldCheck,
   Trash2,
   Unlink2,
   X,
 } from "lucide-react";
 import comparexLogo from "./assets/png/comparex-horizontal-light-2x.png";
+import { createAnnotatedPdf } from "./annotatedPdf";
 import type { EvidenceMark } from "./PdfPreview";
 import type { RequirementGridRow } from "./RequirementGrid";
 
@@ -92,6 +94,7 @@ function DropPanel({
     pendingLinkId: string | null;
     interactionMode: "highlight" | "link";
     marks: EvidenceMark[];
+    requirementNumberByLinkId?: ReadonlyMap<string, string>;
     onCreateMark: (mark: EvidenceMark, intent: "highlight" | "link") => void;
   };
 }) {
@@ -184,10 +187,12 @@ function DropPanel({
               key={uploadedFile.url}
               file={uploadedFile.file}
               url={uploadedFile.url}
+              sourceUrl={uploadedFile.url}
               side={previewProps?.side ?? "tor"}
               pendingLinkId={previewProps?.pendingLinkId ?? null}
               interactionMode={previewProps?.interactionMode ?? "highlight"}
               marks={previewProps?.marks ?? []}
+              requirementNumberByLinkId={previewProps?.requirementNumberByLinkId}
               onCreateMark={previewProps?.onCreateMark ?? (() => undefined)}
             />
           ) : (
@@ -315,6 +320,7 @@ export default function Home() {
   const [isResizing, setIsResizing] = useState(false);
   const [catalogFiles, setCatalogFiles] = useState<UploadedFile[]>([]);
   const [isCatalogMenuOpen, setIsCatalogMenuOpen] = useState(false);
+  const [isPrintingEvidence, setIsPrintingEvidence] = useState(false);
   const [marks, setMarks] = useState<EvidenceMark[]>([]);
   const [pendingLinkId, setPendingLinkId] = useState<string | null>(null);
   const [isReviewOpen, setIsReviewOpen] = useState(false);
@@ -838,6 +844,14 @@ export default function Home() {
   const requirementRows = flattenRequirements(rootRequirements).filter(({ mark }) =>
     visibleTorIds.has(mark.id),
   );
+  const requirementNumberByLinkId = new Map<string, string>();
+  for (const { mark, path } of flattenRequirements(rootRequirements)) {
+    if (!mark.linkId) continue;
+    requirementNumberByLinkId.set(
+      mark.linkId,
+      mark.requirementNo?.trim() || path,
+    );
+  }
   const showUnlinkedEvidence = reviewFilter !== "linked";
   const gridRows: RequirementGridRow[] = [
     ...requirementRows.map(({ mark, path, depth }) => ({
@@ -862,6 +876,62 @@ export default function Home() {
         }))
       : []),
   ];
+
+  const printAnnotatedEvidence = async () => {
+    const evidenceFile = files.right;
+    if (!evidenceFile || !isPdfFile(evidenceFile.file)) return;
+
+    const annotations = marks.flatMap((mark) => {
+      if (mark.side !== "catalog" || mark.fileUrl !== evidenceFile.url) {
+        return [];
+      }
+      const anchor = mark.annotation ??
+        (mark.area ? { x: mark.area.x, y: mark.area.y } : undefined);
+      return anchor
+        ? [{
+            mark,
+            anchor,
+            requirementNo: mark.linkId
+              ? requirementNumberByLinkId.get(mark.linkId)
+              : undefined,
+          }]
+        : [];
+    });
+    if (!annotations.length) {
+      window.alert("No evidence highlights with a saved position to print.");
+      return;
+    }
+
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      window.alert("Could not open the print window. Please allow pop-ups and try again.");
+      return;
+    }
+    printWindow.document.title = "Preparing annotated PDF";
+    printWindow.document.body.textContent = "Preparing annotated PDF for printing…";
+    setIsPrintingEvidence(true);
+    try {
+      const exported = await createAnnotatedPdf(evidenceFile.file, annotations);
+      const printUrl = URL.createObjectURL(
+        exported,
+      );
+      printWindow.addEventListener(
+        "load",
+        () => {
+          printWindow.focus();
+          printWindow.print();
+          window.setTimeout(() => URL.revokeObjectURL(printUrl), 60_000);
+        },
+        { once: true },
+      );
+      printWindow.location.replace(printUrl);
+    } catch {
+      printWindow.close();
+      window.alert("Could not prepare the annotated PDF for printing. Please try another PDF file.");
+    } finally {
+      setIsPrintingEvidence(false);
+    }
+  };
 
   const resizePanels = (event: PointerEvent<HTMLDivElement>) => {
     if (!isResizing) return;
@@ -1198,6 +1268,7 @@ export default function Home() {
             marks: marks.filter(
               (mark) => mark.side === "catalog" && mark.fileName === files.right?.file.name,
             ),
+            requirementNumberByLinkId,
             onCreateMark: createEvidenceMark,
           }}
           toolbar={
@@ -1299,6 +1370,26 @@ export default function Home() {
                 title="Add documents"
               >
                 <Plus aria-hidden="true" size={16} />
+              </button>
+              <button
+                className="catalog-print-button"
+                type="button"
+                onClick={() => void printAnnotatedEvidence()}
+                disabled={
+                  isPrintingEvidence ||
+                  !files.right ||
+                  !isPdfFile(files.right.file) ||
+                  !marks.some(
+                    (mark) =>
+                      mark.side === "catalog" &&
+                      mark.fileUrl === files.right?.url &&
+                      Boolean(mark.linkId && requirementNumberByLinkId.has(mark.linkId)),
+                  )
+                }
+                aria-label="Print annotated Product Evidence PDF"
+                title="Print annotated PDF"
+              >
+                <Printer aria-hidden="true" size={16} />
               </button>
               <input
                 ref={catalogPickerRef}
@@ -1404,6 +1495,7 @@ export default function Home() {
             : null}
           <RequirementGrid
             rows={gridRows}
+            showStartHint={!marks.length}
             onJump={jumpToEvidenceMark}
             onUnlink={unlinkEvidenceMark}
             onDropEvidence={linkDroppedEvidence}
@@ -1416,9 +1508,6 @@ export default function Home() {
             onSelectForLink={linkExistingMark}
             onDeleteRequirements={removeRequirements}
           />
-          {!marks.length ? (
-            <p className="review-empty">Highlight a TOR section or add a requirement to begin.</p>
-          ) : null}
           {marks.length && !visibleTorMarks.length &&
           !(showUnlinkedEvidence && unlinkedCatalogMarks.length) ? (
             <p className="review-empty">No highlights match this filter.</p>

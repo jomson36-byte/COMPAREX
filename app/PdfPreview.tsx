@@ -10,9 +10,15 @@ import { createStore, PDFSlickViewer } from "@pdfslick/react";
 import { Highlighter, Link2, MessageSquare } from "lucide-react";
 
 type AreaRect = { x: number; y: number; width: number; height: number };
+type DocumentPoint = {
+  x: number;
+  y: number;
+  rects?: AreaRect[];
+};
 type MarkSelection = {
   range?: Range;
   area?: AreaRect;
+  annotation?: DocumentPoint;
   text: string;
   page: number;
   x: number;
@@ -29,6 +35,7 @@ export type EvidenceMark = {
   note?: string;
   linkId?: string;
   area?: AreaRect;
+  annotation?: DocumentPoint;
   manual?: boolean;
   parentId?: string;
   requirementNo?: string;
@@ -37,18 +44,24 @@ export type EvidenceMark = {
 export default function PdfPreview({
   file,
   url,
+  sourceUrl,
   side,
   pendingLinkId,
   interactionMode,
   marks,
+  requirementNumberByLinkId,
+  renderAnnotations = true,
   onCreateMark,
 }: {
   file: File;
   url: string;
+  sourceUrl?: string;
   side: "tor" | "catalog";
   pendingLinkId: string | null;
   interactionMode: "highlight" | "link";
   marks: EvidenceMark[];
+  requirementNumberByLinkId?: ReadonlyMap<string, string>;
+  renderAnnotations?: boolean;
   onCreateMark: (mark: EvidenceMark, intent: "highlight" | "link") => void;
 }) {
   const [container, setContainer] = useState<HTMLElement | null>(null);
@@ -88,33 +101,94 @@ export default function PdfPreview({
   const scale = usePDFSlickStore((state) => state.scale);
 
   useEffect(() => {
-    if (!isDocumentLoaded || !container) return;
+    if (!isDocumentLoaded || !container || !renderAnnotations) return;
 
     const restoreHighlights = window.setTimeout(() => {
+      container
+        .querySelectorAll("[data-requirement-reference], [data-area-mark], [data-annotation-canvas]")
+        .forEach((element) => element.remove());
+
+      const canvases = new Map<HTMLElement, CanvasRenderingContext2D>();
+      const drawAnnotation = (mark: EvidenceMark, page: HTMLElement, rects: AreaRect[]) => {
+        if (!rects.length) return;
+        let context = canvases.get(page);
+        if (!context) {
+          const canvas = document.createElement("canvas");
+          const ratio = window.devicePixelRatio || 1;
+          canvas.className = "page-annotation-canvas";
+          canvas.dataset.annotationCanvas = "true";
+          canvas.width = Math.round(page.clientWidth * ratio);
+          canvas.height = Math.round(page.clientHeight * ratio);
+          canvas.style.width = "100%";
+          canvas.style.height = "100%";
+          page.appendChild(canvas);
+          const canvasContext = canvas.getContext("2d");
+          if (!canvasContext) return;
+          context = canvasContext;
+          context.scale(ratio, ratio);
+          canvases.set(page, context);
+        }
+        const { width, height } = page.getBoundingClientRect();
+        const isAreaMark = Boolean(mark.area);
+        context.fillStyle = isAreaMark ? "rgb(59 130 246 / 23%)" : "rgb(59 130 246 / 32%)";
+        context.strokeStyle = "#3b82f6";
+        context.lineWidth = isAreaMark ? 2 : 1.2;
+        rects.forEach((rect) => {
+          const x = rect.x * width;
+          const y = rect.y * height;
+          const rectWidth = rect.width * width;
+          const rectHeight = rect.height * height;
+          context.fillRect(x, y, rectWidth, rectHeight);
+          if (isAreaMark) {
+            context.setLineDash([4, 3]);
+            context.strokeRect(x, y, rectWidth, rectHeight);
+            context.setLineDash([]);
+          } else {
+            context.beginPath();
+            context.moveTo(x, y + rectHeight);
+            context.lineTo(x + rectWidth, y + rectHeight);
+            context.stroke();
+          }
+        });
+        const requirementNo = mark.linkId ? requirementNumberByLinkId?.get(mark.linkId) : undefined;
+        const anchor = mark.annotation ?? (mark.area ? { x: mark.area.x, y: mark.area.y } : undefined);
+        if (!requirementNo || !anchor) return;
+        const labelAnchor = mark.area ? anchor : anchor.rects?.[0] ?? anchor;
+        const fontSize = Math.max(10, width * 0.015);
+        context.font = `700 ${fontSize}px Arial, Helvetica, sans-serif`;
+        const label = `#${requirementNo}`;
+        const paddingX = fontSize * 0.45;
+        const paddingY = fontSize * 0.28;
+        const labelWidth = context.measureText(label).width + paddingX * 2;
+        const labelHeight = fontSize * 1.25 + paddingY * 2;
+        const x = Math.min(Math.max(labelAnchor.x * width, 0), width - labelWidth);
+        const y = Math.max(labelAnchor.y * height - labelHeight, 0);
+        context.fillStyle = "#1d4ed8";
+        context.fillRect(x, y, labelWidth, labelHeight);
+        context.fillStyle = "#eff6ff";
+        context.fillText(label, x + paddingX, y + labelHeight - paddingY - fontSize * 0.16);
+      };
+
       for (const mark of marks) {
         if (mark.area) {
           const page = container.querySelector<HTMLElement>(
             `.page[data-page-number="${mark.page}"]`,
           );
-          if (!page || page.querySelector(`[data-area-mark="${mark.id}"]`)) {
-            continue;
-          }
-          const overlay = document.createElement("div");
-          overlay.className = `area-highlight ${mark.side}`;
-          overlay.dataset.areaMark = mark.id;
-          overlay.style.left = `${mark.area.x * 100}%`;
-          overlay.style.top = `${mark.area.y * 100}%`;
-          overlay.style.width = `${mark.area.width * 100}%`;
-          overlay.style.height = `${mark.area.height * 100}%`;
-          page.appendChild(overlay);
+          if (!page) continue;
+          drawAnnotation(mark, page, [mark.area]);
           continue;
         }
-        if (rangesRef.current.has(mark.id)) continue;
         const page = container.querySelector(
           `.page[data-page-number="${mark.page}"]`,
         );
         const textLayer = page?.querySelector(".textLayer");
         if (!textLayer) continue;
+
+        const existingRange = rangesRef.current.get(mark.id);
+        if (existingRange) {
+          drawAnnotation(mark, page as HTMLElement, mark.annotation?.rects ?? []);
+          continue;
+        }
 
         const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
         const nodes: Text[] = [];
@@ -153,12 +227,8 @@ export default function PdfPreview({
         range.setStart(startNode, startOffset);
         range.setEnd(endNode, endOffset);
         rangesRef.current.set(mark.id, range);
+        drawAnnotation(mark, page as HTMLElement, mark.annotation?.rects ?? []);
       }
-
-      CSS.highlights.set(
-        `comparex-${side}`,
-        new Highlight(...rangesRef.current.values()),
-      );
       for (const mark of marks) {
         const isReady = mark.area
           ? Boolean(container.querySelector(`[data-area-mark="${mark.id}"]`))
@@ -172,7 +242,7 @@ export default function PdfPreview({
     }, 100);
 
     return () => window.clearTimeout(restoreHighlights);
-  }, [container, isDocumentLoaded, marks, scale, side]);
+  }, [container, isDocumentLoaded, marks, renderAnnotations, requirementNumberByLinkId, scale, side]);
 
   const commitMark = (
     candidate: MarkSelection,
@@ -183,10 +253,6 @@ export default function PdfPreview({
     if (candidate.range) {
       const range = candidate.range.cloneRange();
       rangesRef.current.set(id, range);
-      CSS.highlights.set(
-        `comparex-${side}`,
-        new Highlight(...rangesRef.current.values()),
-      );
     }
 
     onCreateMark(
@@ -194,10 +260,13 @@ export default function PdfPreview({
         id,
         side,
         fileName: file.name,
-        fileUrl: url,
+        fileUrl: sourceUrl ?? url,
         page: candidate.page,
         text: candidate.text,
         area: candidate.area,
+        annotation:
+          candidate.annotation ??
+          (candidate.area ? { x: candidate.area.x, y: candidate.area.y } : undefined),
         note,
         linkId:
           intent === "link" && side === "catalog"
@@ -236,10 +305,24 @@ export default function PdfPreview({
         : range.startContainer.parentElement;
     const pageElement = element?.closest(".page");
     const bounds = range.getBoundingClientRect();
+    const pageBounds = pageElement?.getBoundingClientRect();
     const nextSelection: MarkSelection = {
       range: range.cloneRange(),
       text,
       page: Number(pageElement?.getAttribute("data-page-number")) || pageNumber,
+      annotation:
+        pageBounds && pageBounds.width && pageBounds.height
+          ? {
+              x: (bounds.left - pageBounds.left) / pageBounds.width,
+              y: (bounds.top - pageBounds.top) / pageBounds.height,
+              rects: Array.from(range.getClientRects()).map((rect) => ({
+                x: (rect.left - pageBounds.left) / pageBounds.width,
+                y: (rect.top - pageBounds.top) / pageBounds.height,
+                width: rect.width / pageBounds.width,
+                height: rect.height / pageBounds.height,
+              })),
+            }
+          : undefined,
       x: Math.min(window.innerWidth - 210, Math.max(12, bounds.left)),
       y: Math.max(12, bounds.top - 46),
     };
