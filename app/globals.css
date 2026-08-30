@@ -706,6 +706,25 @@ button:disabled {
   pointer-events: none;
 }
 
+.page-annotation-badge-hit {
+  position: absolute;
+  z-index: 13;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: grab;
+}
+
+.page-annotation-badge-hit:active {
+  cursor: grabbing;
+}
+
+.page-annotation-badge-hit:focus-visible {
+  outline: 2px solid #14b8a6;
+  outline-offset: 2px;
+}
+
 .area-highlight {
   position: absolute;
   z-index: 12;

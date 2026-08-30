@@ -57,14 +57,32 @@ export async function createAnnotatedPdf(
     const paddingY = 3;
     const labelWidth = font.widthOfTextAtSize(label, fontSize) + paddingX * 2;
     const labelHeight = fontSize + paddingY * 2;
-    const x = Math.min(
+    const homeX = Math.min(
       Math.max(cropX + labelAnchor.x * width, cropX),
       cropX + width - labelWidth,
     );
-    const y = Math.min(
-      Math.max(cropY + height - labelAnchor.y * height, cropY),
-      cropY + height - labelHeight,
+    const homeTop = Math.min(
+      Math.max(labelAnchor.y * height - labelHeight, 0),
+      height - labelHeight,
     );
+    const x = mark.labelPosition
+      ? Math.min(
+          Math.max(cropX + mark.labelPosition.x * width, cropX),
+          cropX + width - labelWidth,
+        )
+      : Math.min(
+          Math.max(homeX + (mark.labelOffset?.x ?? 0) * width, cropX),
+          cropX + width - labelWidth,
+        );
+    const y = mark.labelPosition
+      ? Math.min(
+          Math.max(cropY + height - mark.labelPosition.y * height - labelHeight, cropY),
+          cropY + height - labelHeight,
+        )
+      : cropY + height - Math.min(
+          Math.max(homeTop + (mark.labelOffset?.y ?? 0) * height, 0),
+          height - labelHeight,
+        ) - labelHeight;
     page.drawRectangle({
       x,
       y,

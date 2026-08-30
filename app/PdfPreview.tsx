@@ -36,6 +36,8 @@ export type EvidenceMark = {
   linkId?: string;
   area?: AreaRect;
   annotation?: DocumentPoint;
+  labelPosition?: DocumentPoint;
+  labelOffset?: DocumentPoint;
   manual?: boolean;
   parentId?: string;
   requirementNo?: string;
@@ -51,6 +53,7 @@ export default function PdfPreview({
   marks,
   requirementNumberByLinkId,
   renderAnnotations = true,
+  onMoveMark,
   onCreateMark,
 }: {
   file: File;
@@ -62,6 +65,11 @@ export default function PdfPreview({
   marks: EvidenceMark[];
   requirementNumberByLinkId?: ReadonlyMap<string, string>;
   renderAnnotations?: boolean;
+  onMoveMark?: (
+    id: string,
+    position: DocumentPoint,
+    offset: DocumentPoint,
+  ) => void;
   onCreateMark: (mark: EvidenceMark, intent: "highlight" | "link") => void;
 }) {
   const [container, setContainer] = useState<HTMLElement | null>(null);
@@ -105,7 +113,9 @@ export default function PdfPreview({
 
     const restoreHighlights = window.setTimeout(() => {
       container
-        .querySelectorAll("[data-requirement-reference], [data-area-mark], [data-annotation-canvas]")
+        .querySelectorAll(
+          "[data-requirement-reference], [data-area-mark], [data-annotation-canvas], [data-annotation-badge-hit]",
+        )
         .forEach((element) => element.remove());
 
       const canvases = new Map<HTMLElement, CanvasRenderingContext2D>();
@@ -161,12 +171,94 @@ export default function PdfPreview({
         const paddingY = fontSize * 0.28;
         const labelWidth = context.measureText(label).width + paddingX * 2;
         const labelHeight = fontSize * 1.25 + paddingY * 2;
-        const x = Math.min(Math.max(labelAnchor.x * width, 0), width - labelWidth);
-        const y = Math.max(labelAnchor.y * height - labelHeight, 0);
+        const homeX = Math.min(Math.max(labelAnchor.x * width, 0), width - labelWidth);
+        const homeY = Math.max(labelAnchor.y * height - labelHeight, 0);
+        const offsetX = (mark.labelOffset?.x ?? 0) * width;
+        const offsetY = (mark.labelOffset?.y ?? 0) * height;
+        const x = Math.min(
+          Math.max(mark.labelPosition ? mark.labelPosition.x * width : homeX + offsetX, 0),
+          width - labelWidth,
+        );
+        const y = mark.labelPosition
+          ? Math.min(Math.max(mark.labelPosition.y * height, 0), height - labelHeight)
+          : Math.min(Math.max(homeY + offsetY, 0), height - labelHeight);
         context.fillStyle = "#1d4ed8";
         context.fillRect(x, y, labelWidth, labelHeight);
         context.fillStyle = "#eff6ff";
         context.fillText(label, x + paddingX, y + labelHeight - paddingY - fontSize * 0.16);
+
+        if (!onMoveMark) return;
+
+        // The annotation itself stays on the page canvas so it matches the print
+        // output. This transparent button is only its interactive hit target.
+        const badgeHitTarget = document.createElement("div");
+        badgeHitTarget.className = "page-annotation-badge-hit";
+        badgeHitTarget.dataset.annotationBadgeHit = mark.id;
+        badgeHitTarget.setAttribute("role", "button");
+        badgeHitTarget.tabIndex = 0;
+        badgeHitTarget.setAttribute("aria-label", `Move requirement ${label}`);
+        badgeHitTarget.style.left = `${x}px`;
+        badgeHitTarget.style.top = `${y}px`;
+        badgeHitTarget.style.width = `${labelWidth}px`;
+        badgeHitTarget.style.height = `${labelHeight}px`;
+        page.appendChild(badgeHitTarget);
+
+        badgeHitTarget.addEventListener("pointerdown", (event) => {
+          if (event.button !== 0 || !onMoveMark) return;
+          event.preventDefault();
+          event.stopPropagation();
+          badgeHitTarget.setPointerCapture(event.pointerId);
+
+          const startX = event.clientX;
+          const startY = event.clientY;
+          const initialX = x;
+          const initialY = y;
+          // Keep the reference close to its evidence. Pointer capture also keeps
+          // this gesture bound to the page where it started.
+          const maxDistance = Math.min(width, height) * 0.14;
+          let nextX = initialX;
+          let nextY = initialY;
+
+          const move = (moveEvent: PointerEvent) => {
+            const pageBounds = page.getBoundingClientRect();
+            const pageX = Math.min(
+              Math.max(initialX + moveEvent.clientX - startX, 0),
+              pageBounds.width - labelWidth,
+            );
+            const pageY = Math.min(
+              Math.max(initialY + moveEvent.clientY - startY, 0),
+              pageBounds.height - labelHeight,
+            );
+            const offsetX = pageX - homeX;
+            const offsetY = pageY - homeY;
+            const distance = Math.hypot(offsetX, offsetY);
+            const scale = distance > maxDistance ? maxDistance / distance : 1;
+            nextX = homeX + offsetX * scale;
+            nextY = homeY + offsetY * scale;
+            badgeHitTarget.style.left = `${nextX}px`;
+            badgeHitTarget.style.top = `${nextY}px`;
+          };
+          const finish = () => {
+            badgeHitTarget.removeEventListener("pointermove", move);
+            badgeHitTarget.removeEventListener("pointercancel", finish);
+            try {
+              badgeHitTarget.releasePointerCapture(event.pointerId);
+            } catch {
+              // The browser may already have released capture after a cancelled drag.
+            }
+            const pageBounds = page.getBoundingClientRect();
+            onMoveMark(mark.id, {
+              x: nextX / pageBounds.width,
+              y: nextY / pageBounds.height,
+            }, {
+              x: (nextX - homeX) / pageBounds.width,
+              y: (nextY - homeY) / pageBounds.height,
+            });
+          };
+          badgeHitTarget.addEventListener("pointermove", move);
+          badgeHitTarget.addEventListener("pointerup", finish, { once: true });
+          badgeHitTarget.addEventListener("pointercancel", finish, { once: true });
+        });
       };
 
       for (const mark of marks) {
@@ -230,19 +322,17 @@ export default function PdfPreview({
         drawAnnotation(mark, page as HTMLElement, mark.annotation?.rects ?? []);
       }
       for (const mark of marks) {
-        const isReady = mark.area
-          ? Boolean(container.querySelector(`[data-area-mark="${mark.id}"]`))
-          : rangesRef.current.has(mark.id);
-        if (isReady) {
-          window.dispatchEvent(
-            new CustomEvent("comparex:mark-ready", { detail: mark.id }),
-          );
-        }
+        // A target page may be virtualized and not have a text range yet. The
+        // caller can safely navigate as soon as this document is ready; the
+        // jump handler will render the requested page before centring it.
+        window.dispatchEvent(
+          new CustomEvent("comparex:mark-ready", { detail: mark.id }),
+        );
       }
     }, 100);
 
     return () => window.clearTimeout(restoreHighlights);
-  }, [container, isDocumentLoaded, marks, renderAnnotations, requirementNumberByLinkId, scale, side]);
+  }, [container, isDocumentLoaded, marks, onMoveMark, renderAnnotations, requirementNumberByLinkId, scale, side]);
 
   const commitMark = (
     candidate: MarkSelection,
@@ -442,17 +532,27 @@ export default function PdfPreview({
   useEffect(() => {
     const jumpToMark = (event: Event) => {
       const id = (event as CustomEvent<string>).detail;
-      const area = container?.querySelector<HTMLElement>(`[data-area-mark="${id}"]`);
-      const range = rangesRef.current.get(id);
-      const target =
-        range?.startContainer.nodeType === Node.ELEMENT_NODE
-          ? (range.startContainer as Element)
-          : range?.startContainer.parentElement;
-      (area ?? target)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      const mark = marks.find((item) => item.id === id);
+      if (!mark || !container) return;
+
+      // Text ranges are created only after a page is rendered. Navigate to the
+      // source page first, then centre the precise highlight when it is ready.
+      pdfSlick?.gotoPage(mark.page);
+      window.setTimeout(() => {
+        const page = container.querySelector<HTMLElement>(
+          `.page[data-page-number="${mark.page}"]`,
+        );
+        const range = rangesRef.current.get(id);
+        const target =
+          range?.startContainer.nodeType === Node.ELEMENT_NODE
+            ? (range.startContainer as Element)
+            : range?.startContainer.parentElement;
+        (target ?? page)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 120);
     };
     window.addEventListener("comparex:jump-to-mark", jumpToMark);
     return () => window.removeEventListener("comparex:jump-to-mark", jumpToMark);
-  }, [container]);
+  }, [container, marks, pdfSlick]);
 
   useEffect(() => {
     const removeMark = (event: Event) => {

@@ -96,6 +96,11 @@ function DropPanel({
     marks: EvidenceMark[];
     requirementNumberByLinkId?: ReadonlyMap<string, string>;
     onCreateMark: (mark: EvidenceMark, intent: "highlight" | "link") => void;
+    onMoveMark?: (
+      id: string,
+      position: { x: number; y: number },
+      offset: { x: number; y: number },
+    ) => void;
   };
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -194,6 +199,7 @@ function DropPanel({
               marks={previewProps?.marks ?? []}
               requirementNumberByLinkId={previewProps?.requirementNumberByLinkId}
               onCreateMark={previewProps?.onCreateMark ?? (() => undefined)}
+              onMoveMark={previewProps?.onMoveMark}
             />
           ) : (
             <div className="file-state">
@@ -322,6 +328,10 @@ export default function Home() {
   const [isCatalogMenuOpen, setIsCatalogMenuOpen] = useState(false);
   const [isPrintingEvidence, setIsPrintingEvidence] = useState(false);
   const [marks, setMarks] = useState<EvidenceMark[]>([]);
+  const [catalogLabelOffset, setCatalogLabelOffset] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [pendingLinkId, setPendingLinkId] = useState<string | null>(null);
   const [isReviewOpen, setIsReviewOpen] = useState(false);
   const [isReviewPinned, setIsReviewPinned] = useState(false);
@@ -463,6 +473,7 @@ export default function Home() {
     setCatalogFiles([]);
     setIsCatalogMenuOpen(false);
     setMarks([]);
+    setCatalogLabelOffset(null);
     setPendingLinkId(null);
     setInteractionMode("highlight");
   };
@@ -471,15 +482,19 @@ export default function Home() {
     mark: EvidenceMark,
     intent: "highlight" | "link",
   ) => {
+    const markWithLabelDefault =
+      mark.side === "catalog" && catalogLabelOffset
+        ? { ...mark, labelOffset: catalogLabelOffset }
+        : mark;
     if (intent === "link" && mark.side === "tor") {
       const linkId = crypto.randomUUID();
-      setMarks((current) => [...current, { ...mark, linkId }]);
+      setMarks((current) => [...current, { ...markWithLabelDefault, linkId }]);
       setPendingLinkId(linkId);
       setInteractionMode("link");
       return;
     }
 
-    setMarks((current) => [...current, mark]);
+    setMarks((current) => [...current, markWithLabelDefault]);
     if (intent === "link" && mark.side === "catalog" && pendingLinkId) {
       setPendingLinkId(null);
     }
@@ -1222,6 +1237,12 @@ export default function Home() {
               (mark) => mark.side === "tor" && mark.fileName === files.left?.file.name,
             ),
             onCreateMark: createEvidenceMark,
+            onMoveMark: (id, labelPosition) =>
+              setMarks((current) =>
+                current.map((mark) =>
+                  mark.id === id ? { ...mark, labelPosition } : mark,
+                ),
+              ),
           }}
         />
         <div
@@ -1269,6 +1290,14 @@ export default function Home() {
               (mark) => mark.side === "catalog" && mark.fileName === files.right?.file.name,
             ),
             requirementNumberByLinkId,
+            onMoveMark: (id, labelPosition, labelOffset) => {
+              setCatalogLabelOffset(labelOffset);
+              setMarks((current) =>
+                current.map((mark) =>
+                  mark.id === id ? { ...mark, labelPosition } : mark,
+                ),
+              );
+            },
             onCreateMark: createEvidenceMark,
           }}
           toolbar={
@@ -1507,6 +1536,7 @@ export default function Home() {
             isLinkMode={interactionMode === "link"}
             onSelectForLink={linkExistingMark}
             onDeleteRequirements={removeRequirements}
+            onRemoveUnassignedEvidence={removeEvidenceMark}
           />
           {marks.length && !visibleTorMarks.length &&
           !(showUnlinkedEvidence && unlinkedCatalogMarks.length) ? (

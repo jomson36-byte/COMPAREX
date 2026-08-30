@@ -45,6 +45,7 @@ type Props = {
   isLinkMode: boolean;
   onSelectForLink: (mark: EvidenceMark) => void;
   onDeleteRequirements: (marks: EvidenceMark[]) => void;
+  onRemoveUnassignedEvidence: (mark: EvidenceMark) => void;
 };
 
 const columns: GridColumn[] = [
@@ -63,15 +64,15 @@ const textCell = (data: string, themeOverride?: GridCell["themeOverride"]): Grid
   themeOverride,
 });
 
-const sourceCell = (mark: EvidenceMark, fallback: string): GridCell => {
-  if (!mark.fileUrl) return textCell(fallback, { textDark: "#64748b" });
+const sourceCell = (mark: EvidenceMark | undefined, fallback: string): GridCell => {
+  if (!mark?.fileUrl) return textCell(fallback, { textDark: "#64748b" });
 
   return {
     kind: GridCellKind.Uri,
     allowOverlay: false,
     readonly: true,
     data: mark.fileUrl,
-    displayData: mark.fileName,
+    displayData: fallback,
     hoverEffect: true,
     themeOverride: { linkColor: "#5eead4" },
     onClickUri: ({ preventDefault }) => {
@@ -95,6 +96,7 @@ export default function RequirementGrid({
   isLinkMode,
   onSelectForLink,
   onDeleteRequirements,
+  onRemoveUnassignedEvidence,
 }: Props) {
   const gridRef = useRef<DataEditorRef>(null);
   const focusTrailingRow = useRef(false);
@@ -135,6 +137,10 @@ export default function RequirementGrid({
       const row = rows[rowIndex];
       if (!row) return textCell("");
       const isRequirement = row.kind === "requirement";
+      const sourceMark = isRequirement ? row.evidence[0] : row.mark;
+      const sourceFiles = isRequirement
+        ? [...new Set(row.evidence.map((item) => item.fileName))]
+        : [row.mark.fileName];
       const evidenceSummary = isRequirement
         ? (() => {
             const pages = [...new Set(row.evidence.map((item) => item.page))]
@@ -175,8 +181,10 @@ export default function RequirementGrid({
           return textCell("Unassigned evidence", { textDark: "#94a3b8" });
         case 2:
           return sourceCell(
-            row.mark,
-            row.mark.manual ? "Manual" : row.mark.fileName,
+            sourceMark,
+            sourceFiles.length
+              ? `${sourceFiles[0]}${sourceFiles.length > 1 ? ` +${sourceFiles.length - 1}` : ""}`
+              : "No evidence",
           );
         case 3:
           return textCell(evidenceSummary || "Drop evidence here", {
@@ -205,12 +213,12 @@ export default function RequirementGrid({
         return;
       }
       if (column === 3) {
-        const target = row.kind === "requirement" ? row.evidence[0] : row.mark;
+        const target = row.kind === "requirement" ? row.evidence[0] : undefined;
         if (target) onJump(target);
         return;
       }
     },
-    [isLinkMode, onJump, onSelectForLink, rows],
+    [isLinkMode, onJump, onRemoveUnassignedEvidence, onSelectForLink, rows],
   );
 
   const changeSelectedDepth = (isOutdent: boolean, fallbackIndex?: number) => {
@@ -314,8 +322,22 @@ export default function RequirementGrid({
               const row = rows[index];
               return row?.kind === "requirement" ? [row.mark] : [];
             });
+          const selectedUnassignedEvidence = [...selectedIndexes]
+            .sort((a, b) => a - b)
+            .flatMap((index) => {
+              const row = rows[index];
+              return row?.kind === "unassigned" ? [row.mark] : [];
+            });
           if (selectedRequirements.length) {
             onDeleteRequirements(selectedRequirements);
+          }
+          if (
+            selectedUnassignedEvidence.length &&
+            window.confirm(
+              `Remove ${selectedUnassignedEvidence.length} unassigned evidence highlight${selectedUnassignedEvidence.length === 1 ? "" : "s"}?`,
+            )
+          ) {
+            selectedUnassignedEvidence.forEach(onRemoveUnassignedEvidence);
           }
           return false;
         }}
