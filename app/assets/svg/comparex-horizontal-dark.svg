@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 96" role="img" aria-labelledby="title">
+  <title id="title">COMPAREX horizontal logo for light backgrounds</title>
+  <g transform="translate(0)">
+    <path fill="#14B8A6" d="M12 8h27l17 17v55a8 8 0 0 1-8 8H12a8 8 0 0 1-8-8V16a8 8 0 0 1 8-8Z"/>
+    <path fill="#0D9488" d="M39 8v13a4 4 0 0 0 4 4h13Z"/>
+    <path fill="#3B82F6" d="M48 25 65 8h19a8 8 0 0 1 8 8v64a8 8 0 0 1-8 8H48a8 8 0 0 1-8-8V33a8 8 0 0 1 8-8Z"/>
+    <path fill="#2563EB" d="M75 8v13a4 4 0 0 0 4 4h13Z"/>
+    <path fill="#F8FAFC" d="m31.6 31.7 8.4-8.4 8 8 8-8 8.4 8.4-8 8 8 8-8.4 8.4-8-8-8 8-8.4-8.4 8-8-8-8 8.4-8.4 8 8 8-8Z"/>
+  </g>
+  <text x="116" y="63" fill="#111827" font-family="Inter, Manrope, Arial, sans-serif" font-size="45" font-weight="750" letter-spacing="-1.4">COMPARE</text>
+  <text x="342" y="63" fill="#14B8A6" font-family="Inter, Manrope, Arial, sans-serif" font-size="45" font-weight="800" letter-spacing="-1.4">X</text>
+</svg>

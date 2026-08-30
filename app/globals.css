@@ -1,7 +1,7 @@
 :root {
   color-scheme: dark;
-  background: #050505;
-  color: #f3f3f3;
+  background: #111827;
+  color: #f8fafc;
 }
 
 * {
@@ -16,10 +16,7 @@ body {
 
 body {
   font-family: Arial, Helvetica, sans-serif;
-  background:
-    radial-gradient(circle at 12% 0%, rgba(126, 161, 255, 0.14), transparent 34rem),
-    radial-gradient(circle at 88% 12%, rgba(39, 197, 157, 0.11), transparent 28rem),
-    #050505;
+  background: #111827;
 }
 
 button,
@@ -29,11 +26,11 @@ input {
 
 button {
   min-height: 2.75rem;
-  border: 1px solid #3b3b3b;
+  border: 1px solid #475569;
   border-radius: 8px;
   padding: 0 1rem;
-  color: #f8f8f8;
-  background: #181818;
+  color: #f8fafc;
+  background: #1e293b;
   cursor: pointer;
   transition:
     background 160ms ease,
@@ -42,13 +39,13 @@ button {
 }
 
 button:hover:not(:disabled) {
-  border-color: #777;
-  background: #242424;
+  border-color: #64748b;
+  background: #334155;
   transform: translateY(-1px);
 }
 
 button:disabled {
-  color: #666;
+  color: #64748b;
   cursor: not-allowed;
 }
 
@@ -59,52 +56,102 @@ button:disabled {
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 52px;
-  border-bottom: 1px solid #202020;
-  padding: 0 18px;
+  gap: 12px;
+  min-height: 56px;
+  border-bottom: 1px solid #334155;
+  padding: 0 12px;
   margin-bottom: 0;
-  background: rgba(5, 5, 5, 0.82);
+  background: #111827;
 }
 
-.topbar p {
-  margin: 0 0 6px;
-  color: #9a9a9a;
-  font-size: 0.78rem;
-  font-weight: 700;
-  letter-spacing: 0;
-  text-transform: uppercase;
+.toolbar-brand {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  min-width: 178px;
+  padding-right: 16px;
+  border-right: 1px solid #334155;
 }
 
-.topbar h1 {
-  margin: 0;
-  color: #ffffff;
-  font-size: 1.05rem;
-  line-height: 1;
-  letter-spacing: 0;
+.toolbar-brand img {
+  display: block;
+  width: 158px;
+  height: auto;
 }
 
-.status-chip {
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tool-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #333;
-  border-radius: 999px;
-  min-height: 2.25rem;
-  padding: 0 0.85rem;
-  color: #d9d9d9;
-  background: rgba(255, 255, 255, 0.04);
+  gap: 7px;
+  min-height: 34px;
+  border-color: transparent;
+  padding: 0 10px;
+  color: #cbd5e1;
+  background: transparent;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.tool-button:hover:not(:disabled) {
+  border-color: #475569;
+  background: #1e293b;
+  transform: none;
+}
+
+.tool-button:focus-visible {
+  border-color: #14b8a6;
+  outline: 2px solid #14b8a6;
+  outline-offset: 1px;
+}
+
+.danger-tool:hover:not(:disabled) {
+  border-color: #7f1d1d;
+  color: #fecaca;
+  background: #450a0a;
+}
+
+.toolbar-separator {
+  width: 1px;
+  height: 24px;
+  margin: 0 4px;
+  background: #334155;
+}
+
+.privacy-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  margin-left: auto;
+  padding: 0 8px;
+  color: #99f6e4;
+  font-size: 0.78rem;
   white-space: nowrap;
 }
 
 .workspace {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns:
+    minmax(0, var(--left-panel-width, 50%))
+    7px
+    minmax(0, 1fr);
   gap: 0;
-  height: calc(100vh - 52px);
-  min-height: calc(100vh - 52px);
+  height: calc(100vh - 56px);
+  min-height: calc(100vh - 56px);
   overflow: hidden;
+}
+
+.workspace.resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .drop-panel {
@@ -114,11 +161,49 @@ button:disabled {
   min-height: 0;
   height: 100%;
   overflow: hidden;
-  background: rgba(10, 10, 10, 0.78);
+  background: #0f172a;
 }
 
-.drop-panel + .drop-panel {
-  border-left: 1px solid #272727;
+.drop-panel.version-a {
+  border-top: 3px solid #14b8a6;
+}
+
+.drop-panel.version-b {
+  border-top: 3px solid #3b82f6;
+}
+
+.panel-splitter {
+  position: relative;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  width: 7px;
+  min-width: 7px;
+  padding: 0;
+  cursor: col-resize;
+  touch-action: none;
+  background: #1e293b;
+  outline: none;
+}
+
+.panel-splitter::before {
+  position: absolute;
+  inset: 0 -4px;
+  content: "";
+}
+
+.panel-splitter span {
+  width: 2px;
+  height: 40px;
+  border-radius: 2px;
+  background: #64748b;
+  transition: background 160ms ease;
+}
+
+.panel-splitter:hover span,
+.panel-splitter:focus-visible span,
+.workspace.resizing .panel-splitter span {
+  background: #14b8a6;
 }
 
 .clear-file-button {
@@ -130,17 +215,17 @@ button:disabled {
   width: 1.8rem;
   height: 1.8rem;
   min-height: 1.8rem;
-  border-color: rgba(255, 143, 143, 0.35);
+  border-color: #7f1d1d;
   padding: 0;
-  color: #ffb8b8;
-  background: rgba(255, 105, 105, 0.08);
+  color: #fecaca;
+  background: #450a0a;
   font-size: 1.35rem;
   line-height: 1;
 }
 
 .clear-file-button:hover {
-  border-color: rgba(255, 143, 143, 0.72);
-  background: rgba(255, 105, 105, 0.18);
+  border-color: #ef4444;
+  background: #7f1d1d;
 }
 
 .drop-zone {
@@ -151,9 +236,7 @@ button:disabled {
   overflow: hidden;
   border: 0;
   border-radius: 0;
-  background:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.015)),
-    #0b0b0b;
+  background: #0f172a;
   outline: none;
   transition:
     border-color 180ms ease,
@@ -163,11 +246,16 @@ button:disabled {
 
 .drop-zone:focus-visible,
 .drop-zone.dragging {
-  box-shadow: inset 0 0 0 2px rgba(134, 247, 209, 0.72);
+  box-shadow: inset 0 0 0 2px #14b8a6;
+}
+
+.version-b .drop-zone:focus-visible,
+.version-b .drop-zone.dragging {
+  box-shadow: inset 0 0 0 2px #3b82f6;
 }
 
 .drop-zone.has-file {
-  background: #0b0b0b;
+  background: #0f172a;
 }
 
 .empty-state,
@@ -189,7 +277,7 @@ button:disabled {
 
 .empty-state span,
 .file-details span {
-  color: #969696;
+  color: #94a3b8;
 }
 
 .upload-mark,
@@ -198,18 +286,22 @@ button:disabled {
   place-items: center;
   width: 72px;
   height: 72px;
-  border: 1px solid #3b3b3b;
+  border: 1px solid #475569;
   border-radius: 8px;
-  color: #ffffff;
-  background: #151515;
+  color: #f8fafc;
+  background: #1e293b;
   font-size: 2rem;
   font-weight: 700;
 }
 
 .file-icon {
   width: 84px;
-  color: #86f7d1;
+  color: #14b8a6;
   font-size: 1rem;
+}
+
+.version-b .file-icon {
+  color: #3b82f6;
 }
 
 .file-details {
@@ -226,7 +318,7 @@ button:disabled {
 
 .docx-note {
   max-width: 320px;
-  color: #b9b9b9;
+  color: #cbd5e1;
   font-size: 0.9rem;
   line-height: 1.45;
 }
@@ -261,10 +353,10 @@ button:disabled {
   justify-content: center;
   min-width: 4.4rem;
   min-height: 2rem;
-  border: 1px solid #2d2d2d;
+  border: 1px solid #475569;
   border-radius: 8px;
-  color: #d7d7d7;
-  background: rgba(255, 255, 255, 0.04);
+  color: #e2e8f0;
+  background: #1e293b;
   font-size: 0.82rem;
 }
 
@@ -272,9 +364,9 @@ button:disabled {
   position: relative;
   min-height: 0;
   overflow: hidden;
-  border: 1px solid #242424;
+  border: 1px solid #334155;
   border-radius: 8px;
-  background: #111;
+  background: #0f172a;
 }
 
 .pdf-slick-stage {
@@ -284,12 +376,12 @@ button:disabled {
 
 .pdf-slick-stage .pdfSlickContainer {
   padding: 16px 8px;
-  background: #111;
+  background: #0f172a;
 }
 
 .pdf-slick-stage .pdfViewer .page {
   margin-bottom: 16px;
-  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.38);
+  box-shadow: 0 12px 28px rgb(2 6 23 / 45%);
 }
 
 .preview-status {
@@ -297,13 +389,13 @@ button:disabled {
   top: 50%;
   left: 50%;
   margin: 0;
-  color: #bdbdbd;
+  color: #cbd5e1;
   transform: translate(-50%, -50%);
 }
 
 .error-message {
   margin: 12px 0 0;
-  color: #ff8f8f;
+  color: #fca5a5;
 }
 
 .sr-only {
@@ -321,19 +413,45 @@ button:disabled {
   .topbar {
     align-items: center;
     flex-direction: row;
+    gap: 6px;
+    padding: 0 8px;
+  }
+
+  .toolbar-brand {
+    min-width: auto;
+    padding-right: 8px;
+  }
+
+  .toolbar-brand img {
+    width: 124px;
+  }
+
+  .tool-button {
+    width: 34px;
+    padding: 0;
+  }
+
+  .tool-button span,
+  .privacy-status span,
+  .toolbar-separator {
+    display: none;
   }
 
   .workspace {
     grid-template-columns: 1fr;
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+  }
+
+  .panel-splitter {
+    display: none;
   }
 
   .drop-panel {
     min-height: 0;
   }
 
-  .drop-panel + .drop-panel {
-    border-top: 1px solid #272727;
-    border-left: 0;
+  .drop-panel:last-child {
+    border-top: 1px solid #334155;
   }
 
   .drop-zone {
