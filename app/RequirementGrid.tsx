@@ -52,7 +52,7 @@ const columns: GridColumn[] = [
   { id: "number", title: "No.", width: 68 },
   { id: "requirement", title: "Requirement", width: 230 },
   { id: "source", title: "Source", width: 110 },
-  { id: "evidence", title: "Evidence", width: 300 },
+  { id: "evidence", title: "Evidence", width: 180 },
 ];
 
 const textCell = (data: string, themeOverride?: GridCell["themeOverride"]): GridCell => ({
@@ -82,6 +82,22 @@ const sourceCell = (mark: EvidenceMark | undefined, fallback: string): GridCell 
   };
 };
 
+const parseNumberedRequirements = (value: string) => {
+  const parsed: Array<{ number: string; title: string }> = [];
+  value.split(/\r?\n/).forEach((rawLine) => {
+    const line = rawLine.replace(/\*\*|__/g, "").trim();
+    if (!line) return;
+    const match = line.match(/^(\d+(?:\.\d+)*)[.)]?\s+(.+)$/);
+    if (match) {
+      parsed.push({ number: match[1], title: match[2].trim() });
+      return;
+    }
+    const previous = parsed.at(-1);
+    if (previous) previous.title = `${previous.title} ${line}`.trim();
+  });
+  return parsed;
+};
+
 export default function RequirementGrid({
   rows,
   showStartHint,
@@ -104,6 +120,17 @@ export default function RequirementGrid({
   const [gridSelection, setGridSelection] =
     useState<GridSelection>(emptyGridSelection);
   const selected = selectedRow === null ? null : rows[selectedRow] ?? null;
+
+  const handleGridSelectionChange = useCallback(
+    (selection: GridSelection) => {
+      setGridSelection(selection);
+      if (!isLinkMode) return;
+      const rowIndex = selection.current?.cell[1];
+      const row = rowIndex === undefined ? undefined : rows[rowIndex];
+      if (row?.kind === "requirement") onSelectForLink(row.mark);
+    },
+    [isLinkMode, onSelectForLink, rows],
+  );
 
   useEffect(() => {
     if (!focusTrailingRow.current) return;
@@ -285,24 +312,15 @@ export default function RequirementGrid({
         rows={rows.length + 1}
         getCellContent={getCellContent}
         gridSelection={gridSelection}
-        onGridSelectionChange={setGridSelection}
+        onGridSelectionChange={handleGridSelectionChange}
         rangeSelect="multi-rect"
         rowSelect="multi"
         rowSelectionMode="multi"
         onPaste={(target, values) => {
           if (target[1] !== rows.length || target[0] !== 1) return false;
-          const parsed: Array<{ number: string; title: string }> = [];
-          values.flatMap((row) => row.join(" ").split(/\r?\n/)).forEach((rawLine) => {
-            const line = rawLine.replace(/\*\*|__/g, "").trim();
-            if (!line) return;
-            const match = line.match(/^(\d+(?:\.\d+)*)[.)]?\s+(.+)$/);
-            if (match) {
-              parsed.push({ number: match[1], title: match[2].trim() });
-              return;
-            }
-            const previous = parsed.at(-1);
-            if (previous) previous.title = `${previous.title} ${line}`.trim();
-          });
+          const parsed = parseNumberedRequirements(
+            values.map((row) => row.join("\t")).join("\n"),
+          );
           if (!parsed.length) return false;
           focusTrailingRow.current = true;
           onAddRequirements(parsed);
@@ -355,7 +373,9 @@ export default function RequirementGrid({
           if (!title) return;
           if (rowIndex === rows.length) {
             focusTrailingRow.current = true;
-            onAddRequirement(title);
+            const parsed = parseNumberedRequirements(title);
+            if (parsed.length) onAddRequirements(parsed);
+            else onAddRequirement(title);
             return;
           }
           const row = rows[rowIndex];
@@ -396,7 +416,7 @@ export default function RequirementGrid({
         }}
         rowHeight={52}
         headerHeight={34}
-        rowMarkers="checkbox-visible"
+        rowMarkers="none"
         smoothScrollX
         smoothScrollY
         width="100%"

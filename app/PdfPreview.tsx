@@ -38,6 +38,7 @@ export type EvidenceMark = {
   annotation?: DocumentPoint;
   labelPosition?: DocumentPoint;
   labelOffset?: DocumentPoint;
+  referenceOnly?: boolean;
   manual?: boolean;
   parentId?: string;
   requirementNo?: string;
@@ -359,7 +360,7 @@ export default function PdfPreview({
           (candidate.area ? { x: candidate.area.x, y: candidate.area.y } : undefined),
         note,
         linkId:
-          intent === "link" && side === "catalog"
+          intent === "link" && (side === "catalog" || side === "tor")
             ? pendingLinkId ?? undefined
             : undefined,
       },

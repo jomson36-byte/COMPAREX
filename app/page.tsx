@@ -487,6 +487,15 @@ export default function Home() {
         ? { ...mark, labelOffset: catalogLabelOffset }
         : mark;
     if (intent === "link" && mark.side === "tor") {
+      if (mark.linkId) {
+        // A manually created requirement already owns this link. Keep the
+        // later TOR selection as its source reference, not a new requirement.
+        setMarks((current) => [
+          ...current,
+          { ...markWithLabelDefault, referenceOnly: true },
+        ]);
+        return;
+      }
       const linkId = crypto.randomUUID();
       setMarks((current) => [...current, { ...markWithLabelDefault, linkId }]);
       setPendingLinkId(linkId);
@@ -689,7 +698,10 @@ export default function Home() {
     }
     setMarks((current) =>
       current.map((item) =>
-        item.id === mark.id ? { ...item, parentId } : item,
+        // A hierarchy change makes the structural number authoritative again.
+        item.id === mark.id
+          ? { ...item, parentId, requirementNo: undefined }
+          : item,
       ),
     );
   };
@@ -825,7 +837,9 @@ export default function Home() {
       mark.side === "catalog" &&
       Boolean(mark.linkId && pairedLinkIds.has(mark.linkId)),
   ).length;
-  const torMarks = marks.filter((mark) => mark.side === "tor");
+  const torMarks = marks.filter(
+    (mark) => mark.side === "tor" && !mark.referenceOnly,
+  );
   const unlinkedCatalogMarks = marks.filter(
     (mark) => mark.side === "catalog" &&
       (!mark.linkId || !pairedLinkIds.has(mark.linkId)),
