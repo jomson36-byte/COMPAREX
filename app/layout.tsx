@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import "@pdfslick/react/dist/pdf_viewer.css";
 import "./globals.css";
 
 export const metadata: Metadata = {

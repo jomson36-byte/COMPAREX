@@ -8,6 +8,12 @@ import {
   useRef,
   useState,
 } from "react";
+import dynamic from "next/dynamic";
+
+const PdfPreview = dynamic(() => import("./PdfPreview"), {
+  ssr: false,
+  loading: () => <p className="preview-status">Loading viewer...</p>,
+});
 
 type Slot = "left" | "right";
 
@@ -32,122 +38,6 @@ function formatFileSize(bytes: number) {
   const kilobytes = bytes / 1024;
   if (kilobytes < 1024) return `${kilobytes.toFixed(1)} KB`;
   return `${(kilobytes / 1024).toFixed(1)} MB`;
-}
-
-function PdfPreview({ file }: { file: File }) {
-  const pagesRef = useRef<HTMLDivElement>(null);
-  const [pageCount, setPageCount] = useState(0);
-  const [scale, setScale] = useState(1);
-  const [status, setStatus] = useState("Loading PDF...");
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let isCancelled = false;
-    const renderTasks: Array<{
-      cancel: () => void;
-      promise: Promise<unknown>;
-    }> = [];
-
-    async function renderPdf() {
-      try {
-        const pagesElement = pagesRef.current;
-        if (!pagesElement) return;
-
-        pagesElement.replaceChildren();
-        setStatus("Loading PDF...");
-        setError("");
-        setPageCount(0);
-
-        const pdfjs = await import("pdfjs-dist");
-        pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-          "pdfjs-dist/build/pdf.worker.mjs",
-          import.meta.url,
-        ).toString();
-
-        const data = await file.arrayBuffer();
-        const pdf = await pdfjs.getDocument({ data }).promise;
-
-        if (isCancelled) return;
-
-        setPageCount(pdf.numPages);
-
-        for (let currentPage = 1; currentPage <= pdf.numPages; currentPage += 1) {
-          if (isCancelled) return;
-
-          setStatus(`Rendering page ${currentPage} / ${pdf.numPages}`);
-
-          const page = await pdf.getPage(currentPage);
-          const viewport = page.getViewport({ scale: scale * 1.35 });
-          const canvas = document.createElement("canvas");
-          const context = canvas.getContext("2d");
-
-          if (!context) {
-            throw new Error("Canvas is not available");
-          }
-
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          canvas.setAttribute("aria-label", `${file.name} page ${currentPage}`);
-          pagesElement.appendChild(canvas);
-
-          const renderTask = page.render({
-            canvas,
-            canvasContext: context,
-            viewport,
-          });
-          renderTasks.push(renderTask);
-          await renderTask.promise;
-        }
-
-        if (!isCancelled) setStatus("");
-      } catch (renderError) {
-        if (!isCancelled) {
-          const message =
-            renderError instanceof Error
-              ? renderError.message
-              : "Unable to render PDF";
-          setError(message);
-          setStatus("");
-        }
-      }
-    }
-
-    renderPdf();
-
-    return () => {
-      isCancelled = true;
-      renderTasks.forEach((task) => task.cancel());
-    };
-  }, [file, scale]);
-
-  return (
-    <div className="pdf-preview" onClick={(event) => event.stopPropagation()}>
-      <div className="preview-toolbar">
-        <span>{pageCount ? `${pageCount} pages` : "Preparing"}</span>
-        <button
-          type="button"
-          onClick={() => setScale((current) => Math.max(0.7, current - 0.1))}
-          aria-label="Zoom out"
-        >
-          -
-        </button>
-        <span>{Math.round(scale * 100)}%</span>
-        <button
-          type="button"
-          onClick={() => setScale((current) => Math.min(1.8, current + 0.1))}
-          aria-label="Zoom in"
-        >
-          +
-        </button>
-      </div>
-
-      <div className="pdf-canvas-wrap">
-        {status ? <p className="preview-status">{status}</p> : null}
-        {error ? <p className="error-message">{error}</p> : null}
-        <div className="pdf-pages" ref={pagesRef} />
-      </div>
-    </div>
-  );
 }
 
 function DropPanel({
@@ -238,7 +128,11 @@ function DropPanel({
 
         {uploadedFile ? (
           isPdfFile(uploadedFile.file) ? (
-            <PdfPreview file={uploadedFile.file} />
+            <PdfPreview
+              key={uploadedFile.url}
+              file={uploadedFile.file}
+              url={uploadedFile.url}
+            />
           ) : (
             <div className="file-state">
               <div className="file-icon" aria-hidden="true">

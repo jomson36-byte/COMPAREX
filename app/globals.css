@@ -271,26 +271,25 @@ button:disabled {
 .pdf-canvas-wrap {
   position: relative;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   border: 1px solid #242424;
   border-radius: 8px;
-  padding: 16px;
   background: #111;
 }
 
-.pdf-pages {
-  display: grid;
-  justify-items: center;
-  gap: 16px;
-  min-height: 100%;
+.pdf-slick-stage {
+  position: absolute;
+  inset: 0;
 }
 
-.pdf-pages canvas {
-  display: block;
-  max-width: none;
-  height: auto;
-  background: #fff;
-  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.42);
+.pdf-slick-stage .pdfSlickContainer {
+  padding: 16px 8px;
+  background: #111;
+}
+
+.pdf-slick-stage .pdfViewer .page {
+  margin-bottom: 16px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.38);
 }
 
 .preview-status {
