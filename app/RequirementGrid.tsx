@@ -48,12 +48,46 @@ type Props = {
   onRemoveUnassignedEvidence: (mark: EvidenceMark) => void;
 };
 
-const columns: GridColumn[] = [
-  { id: "number", title: "No.", width: 68 },
-  { id: "requirement", title: "Requirement", width: 230 },
-  { id: "source", title: "Source", width: 110 },
-  { id: "evidence", title: "Evidence", width: 180 },
+const initialColumns: GridColumn[] = [
+  { id: "number", title: "No.", width: 56 },
+  { id: "requirement", title: "Requirement", width: 190 },
+  { id: "source", title: "Source", width: 92 },
+  { id: "evidence", title: "Evidence", width: 150 },
 ];
+const gridColumnStorageKey = "comparex.requirementGrid.columns.v1";
+
+function readPersistedColumns() {
+  try {
+    const raw = window.localStorage.getItem(gridColumnStorageKey);
+    if (!raw) return initialColumns;
+    const saved = JSON.parse(raw) as Record<string, number>;
+    return initialColumns.map((column) => {
+      const width = saved[String(column.id)];
+      return typeof width === "number"
+        ? { ...column, width: Math.min(420, Math.max(44, width)) }
+        : column;
+    });
+  } catch {
+    return initialColumns;
+  }
+}
+
+function writePersistedColumns(columns: GridColumn[]) {
+  try {
+    window.localStorage.setItem(
+      gridColumnStorageKey,
+      JSON.stringify(
+        Object.fromEntries(
+          columns.flatMap((column) =>
+            "width" in column ? [[String(column.id), column.width]] : [],
+          ),
+        ),
+      ),
+    );
+  } catch {
+    // Column sizing is a preference; losing it should not interrupt review work.
+  }
+}
 
 const textCell = (data: string, themeOverride?: GridCell["themeOverride"]): GridCell => ({
   kind: GridCellKind.Text,
@@ -84,14 +118,56 @@ const sourceCell = (mark: EvidenceMark | undefined, fallback: string): GridCell 
 
 const parseNumberedRequirements = (value: string) => {
   const parsed: Array<{ number: string; title: string }> = [];
+  const levels: Array<{ indent: number; number: number }> = [];
+
   value.split(/\r?\n/).forEach((rawLine) => {
-    const line = rawLine.replace(/\*\*|__/g, "").trim();
+    const normalizedLine = rawLine
+      .replace(/\u00a0/g, " ")
+      .replace(/\t/g, "  ");
+    const line = normalizedLine.replace(/\*\*|__/g, "").trim();
     if (!line) return;
-    const match = line.match(/^(\d+(?:\.\d+)*)[.)]?\s+(.+)$/);
+    const match = normalizedLine
+      .replace(/\*\*|__/g, "")
+      .match(/^(\s*)(\d+(?:\.\d+)*)(?:[.)])?\s+(.+)$/);
+
     if (match) {
-      parsed.push({ number: match[1], title: match[2].trim() });
+      const indent = match[1].length;
+      const rawNumber = match[2];
+      const title = match[3].trim();
+      const number = rawNumber.includes(".")
+        ? rawNumber
+        : (() => {
+            const sameLevelIndex = levels.findIndex(
+              (level) => level.indent === indent,
+            );
+            if (sameLevelIndex >= 0) {
+              levels.splice(sameLevelIndex + 1);
+              levels[sameLevelIndex] = { indent, number: Number(rawNumber) };
+              return levels.map((level) => level.number).join(".");
+            }
+
+            const parentIndex = [...levels]
+              .map((level, index) => ({ level, index }))
+              .reverse()
+              .find(({ level }) => level.indent < indent)?.index;
+
+            if (parentIndex === undefined) {
+              levels.splice(0, levels.length, {
+                indent,
+                number: Number(rawNumber),
+              });
+              return rawNumber;
+            }
+
+            levels.splice(parentIndex + 1);
+            levels.push({ indent, number: Number(rawNumber) });
+            return levels.map((level) => level.number).join(".");
+          })();
+
+      parsed.push({ number, title });
       return;
     }
+
     const previous = parsed.at(-1);
     if (previous) previous.title = `${previous.title} ${line}`.trim();
   });
@@ -117,9 +193,20 @@ export default function RequirementGrid({
   const gridRef = useRef<DataEditorRef>(null);
   const focusTrailingRow = useRef(false);
   const [selectedRow, setSelectedRow] = useState<number | null>(null);
+  const [gridColumns, setGridColumns] = useState<GridColumn[]>(initialColumns);
+  const [hasRestoredColumns, setHasRestoredColumns] = useState(false);
   const [gridSelection, setGridSelection] =
     useState<GridSelection>(emptyGridSelection);
   const selected = selectedRow === null ? null : rows[selectedRow] ?? null;
+
+  useEffect(() => {
+    setGridColumns(readPersistedColumns());
+    setHasRestoredColumns(true);
+  }, []);
+
+  useEffect(() => {
+    if (hasRestoredColumns) writePersistedColumns(gridColumns);
+  }, [gridColumns, hasRestoredColumns]);
 
   const handleGridSelectionChange = useCallback(
     (selection: GridSelection) => {
@@ -308,11 +395,20 @@ export default function RequirementGrid({
       </div>
       <DataEditor
         ref={gridRef}
-        columns={columns}
+        columns={gridColumns}
         rows={rows.length + 1}
         getCellContent={getCellContent}
         gridSelection={gridSelection}
         onGridSelectionChange={handleGridSelectionChange}
+        onColumnResize={(_, newSize, colIndex) => {
+          setGridColumns((current) =>
+            current.map((column, index) =>
+              index === colIndex ? { ...column, width: newSize } : column,
+            ),
+          );
+        }}
+        minColumnWidth={44}
+        maxColumnWidth={420}
         rangeSelect="multi-rect"
         rowSelect="multi"
         rowSelectionMode="multi"
@@ -327,13 +423,50 @@ export default function RequirementGrid({
           return false;
         }}
         onDelete={(selection) => {
-          const selectedIndexes = new Set<number>(selection.rows.toArray());
-          const range = selection.current?.range;
-          if (range) {
-            for (let index = range.y; index < range.y + range.height; index += 1) {
-              selectedIndexes.add(index);
+          const selectedRows = new Set<number>(selection.rows.toArray());
+          const selectedCells = new Map<number, Set<number>>();
+          const addSelectedRange = (range: {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+          }) => {
+            for (let rowIndex = range.y; rowIndex < range.y + range.height; rowIndex += 1) {
+              for (let columnIndex = range.x; columnIndex < range.x + range.width; columnIndex += 1) {
+                const rowCells = selectedCells.get(rowIndex) ?? new Set<number>();
+                rowCells.add(columnIndex);
+                selectedCells.set(rowIndex, rowCells);
+              }
+            }
+          };
+          if (selection.current?.range) addSelectedRange(selection.current.range);
+          selection.current?.rangeStack.forEach(addSelectedRange);
+
+          if (!selectedRows.size) {
+            const selectedEvidence = [...selectedCells]
+              .flatMap(([rowIndex, columns]) => {
+                const row = rows[rowIndex];
+                if (!columns.has(3)) return [];
+                if (row?.kind === "requirement") return row.evidence;
+                if (row?.kind === "unassigned") return [row.mark];
+                return [];
+              })
+              .filter(
+                (mark, index, allMarks) =>
+                  allMarks.findIndex((item) => item.id === mark.id) === index,
+              );
+
+            if (selectedEvidence.length) {
+              selectedEvidence.forEach(onRemoveUnassignedEvidence);
+              return false;
             }
           }
+
+          const selectedIndexes = new Set(selectedRows);
+          selectedCells.forEach((columns, rowIndex) => {
+            if (columns.has(0) || columns.has(1)) selectedIndexes.add(rowIndex);
+          });
+
           const selectedRequirements = [...selectedIndexes]
             .sort((a, b) => a - b)
             .flatMap((index) => {

@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import comparexLogo from "./assets/png/comparex-horizontal-light-2x.png";
 import { createAnnotatedPdf } from "./annotatedPdf";
+import type { PdfAnnotation } from "./annotatedPdf";
 import type { EvidenceMark } from "./PdfPreview";
 import type { RequirementGridRow } from "./RequirementGrid";
 
@@ -52,9 +53,81 @@ type UploadedFile = {
   url: string;
 };
 
+type SelectedDocument = {
+  file: File;
+  handle?: FileSystemFileHandle;
+};
+
+declare global {
+  interface Window {
+    showOpenFilePicker?: (options?: {
+      multiple?: boolean;
+      types?: Array<{
+        description?: string;
+        accept: Record<string, string[]>;
+      }>;
+    }) => Promise<FileSystemFileHandle[]>;
+  }
+
+  interface FileSystemFileHandle {
+    queryPermission?: (descriptor?: {
+      mode: "read" | "readwrite";
+    }) => Promise<PermissionState>;
+    requestPermission?: (descriptor?: {
+      mode: "read" | "readwrite";
+    }) => Promise<PermissionState>;
+  }
+
+  interface DataTransferItem {
+    getAsFileSystemHandle?: () => Promise<FileSystemHandle | null>;
+  }
+}
+
 type ReviewFilter = "all" | "unlinked" | "linked";
 
 const acceptedExtensions = [".pdf", ".docx"];
+const workspaceStorageKey = "comparex.workspace.v1";
+const fileHandleDatabaseName = "comparex-file-handles";
+const fileHandleStoreName = "handles";
+
+type StoredFileHandle = {
+  key: string;
+  name: string;
+  handle: FileSystemFileHandle;
+};
+
+type RestoreFilesResult = {
+  attempted: number;
+  restored: number;
+};
+
+type PrintableFileFailure = {
+  fileName: string;
+  reason: string;
+};
+
+type PersistedWorkspaceState = {
+  version: 1;
+  savedAt: string;
+  workspaceName?: string;
+  marks: EvidenceMark[];
+  panel: {
+    leftWidth: number;
+    requirementStartNumber?: number;
+    requirementStartPath?: string;
+    isReviewOpen: boolean;
+    isReviewPinned: boolean;
+    reviewFilter: ReviewFilter;
+    interactionMode: "highlight" | "link";
+  };
+  catalogLabelOffset: { x: number; y: number } | null;
+  collapsedRequirementIds: string[];
+  files: {
+    torName: string | null;
+    activeEvidenceName: string | null;
+    evidenceNames: string[];
+  };
+};
 
 function isAcceptedFile(file: File) {
   const name = file.name.toLowerCase();
@@ -72,6 +145,177 @@ function formatFileSize(bytes: number) {
   return `${(kilobytes / 1024).toFixed(1)} MB`;
 }
 
+function normalizeRequirementStartPath(value: unknown) {
+  const text = String(value ?? "1").trim();
+  return /^\d+(?:\.\d+)*$/.test(text) ? text : "1";
+}
+
+function getRootRequirementPath(startPath: string, index: number) {
+  const parts = normalizeRequirementStartPath(startPath).split(".");
+  const last = Number(parts.at(-1) ?? 1) + index;
+  return [...parts.slice(0, -1), String(last)].join(".");
+}
+
+function sanitizeMarksForStorage(marks: EvidenceMark[]) {
+  return marks.map(({ fileUrl: _fileUrl, ...mark }) => mark);
+}
+
+function safeReviewFilter(value: unknown): ReviewFilter {
+  return value === "linked" || value === "unlinked" ? value : "all";
+}
+
+function safeInteractionMode(value: unknown): "highlight" | "link" {
+  return value === "link" ? "link" : "highlight";
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error && error.message
+    ? error.message
+    : "Unknown PDF processing error";
+}
+
+function sanitizeWorkspaceName(value: string) {
+  return value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function readPersistedWorkspace(): PersistedWorkspaceState | null {
+  try {
+    const raw = window.localStorage.getItem(workspaceStorageKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PersistedWorkspaceState>;
+    if (parsed.version !== 1) return null;
+    return parsed as PersistedWorkspaceState;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedWorkspace(state: PersistedWorkspaceState) {
+  try {
+    window.localStorage.setItem(workspaceStorageKey, JSON.stringify(state));
+  } catch {
+    // Storage can be unavailable in private windows or full browser profiles.
+  }
+}
+
+function clearPersistedWorkspace() {
+  try {
+    window.localStorage.removeItem(workspaceStorageKey);
+  } catch {
+    // Clearing storage should never block the active review session.
+  }
+}
+
+function openFileHandleDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = window.indexedDB.open(fileHandleDatabaseName, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(fileHandleStoreName, { keyPath: "key" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function withFileHandleStore<T>(
+  mode: IDBTransactionMode,
+  callback: (store: IDBObjectStore) => IDBRequest<T>,
+) {
+  const database = await openFileHandleDatabase();
+  return new Promise<T>((resolve, reject) => {
+    const transaction = database.transaction(fileHandleStoreName, mode);
+    const request = callback(transaction.objectStore(fileHandleStoreName));
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+    transaction.oncomplete = () => database.close();
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error);
+    };
+  });
+}
+
+async function saveFileHandle(key: string, name: string, handle?: FileSystemFileHandle) {
+  if (!handle || !("indexedDB" in window)) return;
+  try {
+    await withFileHandleStore("readwrite", (store) =>
+      store.put({ key, name, handle } satisfies StoredFileHandle),
+    );
+  } catch {
+    // File handles are a convenience layer; metadata autosave still works.
+  }
+}
+
+async function readFileHandle(key: string) {
+  if (!("indexedDB" in window)) return null;
+  try {
+    const record = await withFileHandleStore<StoredFileHandle | undefined>(
+      "readonly",
+      (store) => store.get(key),
+    );
+    return record ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function deleteFileHandle(key: string) {
+  if (!("indexedDB" in window)) return;
+  try {
+    await withFileHandleStore("readwrite", (store) => store.delete(key));
+  } catch {
+    // Ignore stale handles.
+  }
+}
+
+async function clearFileHandles() {
+  if (!("indexedDB" in window)) return;
+  try {
+    await withFileHandleStore("readwrite", (store) => store.clear());
+  } catch {
+    // Ignore stale handles.
+  }
+}
+
+async function getReadableFileFromHandle(record: StoredFileHandle) {
+  try {
+    const permission = record.handle.queryPermission
+      ? await record.handle.queryPermission({ mode: "read" })
+      : "granted";
+    const grantedPermission =
+      permission === "granted" ||
+      (record.handle.requestPermission
+        ? (await record.handle.requestPermission({ mode: "read" })) === "granted"
+        : false);
+    if (!grantedPermission) return null;
+
+    const file = await record.handle.getFile();
+    return isAcceptedFile(file) ? file : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getDroppedDocuments(event: DragEvent<HTMLDivElement>) {
+  const items = Array.from(event.dataTransfer.items);
+  const handleDocuments = await Promise.all<SelectedDocument | null>(
+    items.map(async (item) => {
+      const getHandle = item.getAsFileSystemHandle;
+      if (!getHandle) return null;
+      const handle = await getHandle.call(item);
+      if (handle?.kind !== "file") return null;
+      const fileHandle = handle as FileSystemFileHandle;
+      const file = await fileHandle.getFile();
+      return { file, handle: fileHandle };
+    }),
+  );
+  const documents = handleDocuments.filter(
+    (item): item is SelectedDocument => Boolean(item),
+  );
+  if (documents.length) return documents;
+  return Array.from(event.dataTransfer.files).map((file) => ({ file }));
+}
+
 function DropPanel({
   title,
   tone,
@@ -86,7 +330,7 @@ function DropPanel({
   tone: "version-a" | "version-b";
   uploadedFile: UploadedFile | null;
   multiple?: boolean;
-  onSelect: (files: File[]) => void;
+  onSelect: (documents: SelectedDocument[]) => void;
   onClear?: () => void;
   toolbar?: ReactNode;
   previewProps?: {
@@ -107,9 +351,11 @@ function DropPanel({
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
 
-  const pickFiles = (selectedFiles: File[]) => {
-    const candidates = multiple ? selectedFiles : selectedFiles.slice(0, 1);
-    const accepted = candidates.filter(isAcceptedFile);
+  const pickDocuments = (selectedDocuments: SelectedDocument[]) => {
+    const candidates = multiple
+      ? selectedDocuments
+      : selectedDocuments.slice(0, 1);
+    const accepted = candidates.filter(({ file }) => isAcceptedFile(file));
     const rejected = candidates.length - accepted.length;
 
     setError(
@@ -120,15 +366,55 @@ function DropPanel({
     if (accepted.length) onSelect(accepted);
   };
 
-  const onDrop = (event: DragEvent<HTMLDivElement>) => {
+  const openPicker = async () => {
+    if (typeof window.showOpenFilePicker === "function") {
+      try {
+        const handles = await window.showOpenFilePicker({
+          multiple,
+          types: [
+            {
+              description: "PDF and Word documents",
+              accept: {
+                "application/pdf": [".pdf"],
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [
+                  ".docx",
+                ],
+              },
+            },
+          ],
+        });
+        const documents = await Promise.all(
+          handles.map(async (handle) => ({
+            file: await handle.getFile(),
+            handle,
+          })),
+        );
+        pickDocuments(documents);
+        return;
+      } catch (pickerError) {
+        if (
+          pickerError instanceof DOMException &&
+          pickerError.name === "AbortError"
+        ) {
+          return;
+        }
+      }
+    }
+
+    inputRef.current?.click();
+  };
+
+  const onDrop = async (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
-    pickFiles(Array.from(event.dataTransfer.files));
+    pickDocuments(await getDroppedDocuments(event));
   };
 
   const onInputChange = (event: ChangeEvent<HTMLInputElement>) => {
-    pickFiles(Array.from(event.target.files ?? []));
+    pickDocuments(
+      Array.from(event.target.files ?? []).map((file) => ({ file })),
+    );
     event.target.value = "";
   };
 
@@ -169,11 +455,11 @@ function DropPanel({
         onDrop={onDrop}
         role="button"
         tabIndex={0}
-        onClick={() => inputRef.current?.click()}
+        onClick={() => void openPicker()}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            inputRef.current?.click();
+            void openPicker();
           }
         }}
       >
@@ -322,7 +608,9 @@ export default function Home() {
     left: null,
     right: null,
   });
+  const [workspaceName, setWorkspaceName] = useState("Untitled workspace");
   const [leftWidth, setLeftWidth] = useState(50);
+  const [requirementStartPath, setRequirementStartPath] = useState("1");
   const [isResizing, setIsResizing] = useState(false);
   const [catalogFiles, setCatalogFiles] = useState<UploadedFile[]>([]);
   const [isCatalogMenuOpen, setIsCatalogMenuOpen] = useState(false);
@@ -346,6 +634,11 @@ export default function Home() {
     parentId: string | null;
     value: string;
   } | null>(null);
+  const [storedFileHint, setStoredFileHint] =
+    useState<PersistedWorkspaceState["files"] | null>(null);
+  const [hasRestoredWorkspace, setHasRestoredWorkspace] = useState(false);
+  const [isRestoringFiles, setIsRestoringFiles] = useState(false);
+  const [restoreMessage, setRestoreMessage] = useState("");
   const sessionFilesRef = useRef<{
     tor: UploadedFile | null;
     catalogs: UploadedFile[];
@@ -353,6 +646,235 @@ export default function Home() {
   const workspaceRef = useRef<HTMLElement>(null);
   const catalogMenuRef = useRef<HTMLDetailsElement>(null);
   const catalogPickerRef = useRef<HTMLInputElement>(null);
+
+  const restoreFilesFromHandles = async (
+    fileHint: PersistedWorkspaceState["files"] | null,
+  ): Promise<RestoreFilesResult> => {
+    if (!fileHint) return { attempted: 0, restored: 0 };
+
+    const torHandle = await readFileHandle("tor");
+    const torFile = torHandle
+      ? await getReadableFileFromHandle(torHandle)
+      : null;
+    const restoredCatalogs = await Promise.all(
+      (fileHint.evidenceNames ?? []).map(async (name) => {
+        const record = await readFileHandle(`catalog:${name}`);
+        const file = record ? await getReadableFileFromHandle(record) : null;
+        return file ? { file, url: URL.createObjectURL(file) } : null;
+      }),
+    );
+    const catalogs = restoredCatalogs.filter(
+      (item): item is UploadedFile => Boolean(item),
+    );
+
+    if (torFile) {
+      const url = URL.createObjectURL(torFile);
+      setFiles((current) => ({
+        ...current,
+        left: { file: torFile, url },
+      }));
+      setMarks((current) =>
+        current.map((mark) =>
+          mark.side === "tor" && mark.fileName === torFile.name
+            ? { ...mark, fileUrl: url }
+            : mark,
+        ),
+      );
+    }
+
+    if (catalogs.length) {
+      const active =
+        catalogs.find((item) => item.file.name === fileHint.activeEvidenceName) ??
+        catalogs[0];
+      setCatalogFiles(catalogs);
+      setFiles((current) => ({
+        ...current,
+        right: active,
+      }));
+      setMarks((current) =>
+        current.map((mark) => {
+          if (mark.side !== "catalog") return mark;
+          const match = catalogs.find((item) => item.file.name === mark.fileName);
+          return match ? { ...mark, fileUrl: match.url } : mark;
+        }),
+      );
+    }
+
+    if (torFile || catalogs.length) {
+      setStoredFileHint((current) => ({
+        torName: torFile?.name ?? current?.torName ?? fileHint.torName,
+        activeEvidenceName:
+          catalogs.find((item) => item.file.name === fileHint.activeEvidenceName)
+            ?.file.name ??
+          current?.activeEvidenceName ??
+          fileHint.activeEvidenceName,
+        evidenceNames: Array.from(
+          new Set([
+            ...(current?.evidenceNames ?? fileHint.evidenceNames),
+            ...catalogs.map((item) => item.file.name),
+          ]),
+        ),
+      }));
+    }
+
+    return {
+      attempted: Number(Boolean(fileHint.torName)) + (fileHint.evidenceNames ?? []).length,
+      restored: Number(Boolean(torFile)) + catalogs.length,
+    };
+  };
+
+  const handleRestoreFiles = async () => {
+    setIsRestoringFiles(true);
+    setRestoreMessage("Restoring file access...");
+    try {
+      const result = await restoreFilesFromHandles(storedFileHint);
+      if (!result.attempted) {
+        setRestoreMessage("No saved file references to restore.");
+      } else if (result.restored) {
+        setRestoreMessage(
+          `Restored ${result.restored} of ${result.attempted} saved file${result.attempted === 1 ? "" : "s"}.`,
+        );
+      } else {
+        setRestoreMessage(
+          "Could not restore files automatically. Use Add documents and choose the same files again to refresh permission.",
+        );
+      }
+    } finally {
+      setIsRestoringFiles(false);
+    }
+  };
+
+  const openCatalogPicker = async () => {
+    if (typeof window.showOpenFilePicker === "function") {
+      try {
+        const handles = await window.showOpenFilePicker({
+          multiple: true,
+          types: [
+            {
+              description: "PDF and Word documents",
+              accept: {
+                "application/pdf": [".pdf"],
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [
+                  ".docx",
+                ],
+              },
+            },
+          ],
+        });
+        const documents = await Promise.all(
+          handles.map(async (handle) => ({
+            file: await handle.getFile(),
+            handle,
+          })),
+        );
+        addCatalogFiles(documents.filter(({ file }) => isAcceptedFile(file)));
+        return;
+      } catch (pickerError) {
+        if (
+          pickerError instanceof DOMException &&
+          pickerError.name === "AbortError"
+        ) {
+          return;
+        }
+      }
+    }
+
+    catalogPickerRef.current?.click();
+  };
+
+  useEffect(() => {
+    const restoreWorkspace = async () => {
+      const restored = readPersistedWorkspace();
+      if (!restored) {
+        setHasRestoredWorkspace(true);
+        return;
+      }
+
+      setWorkspaceName(
+        sanitizeWorkspaceName(restored.workspaceName ?? "") ||
+          "Untitled workspace",
+      );
+      setMarks(sanitizeMarksForStorage(restored.marks ?? []));
+      setLeftWidth(
+        Math.min(80, Math.max(20, Number(restored.panel?.leftWidth) || 50)),
+      );
+      setRequirementStartPath(
+        normalizeRequirementStartPath(
+          restored.panel?.requirementStartPath ??
+            restored.panel?.requirementStartNumber,
+        ),
+      );
+      setIsReviewOpen(Boolean(restored.panel?.isReviewOpen));
+      setIsReviewPinned(Boolean(restored.panel?.isReviewPinned));
+      setReviewFilter(safeReviewFilter(restored.panel?.reviewFilter));
+      setInteractionMode(safeInteractionMode(restored.panel?.interactionMode));
+      setCatalogLabelOffset(restored.catalogLabelOffset ?? null);
+      setCollapsedRequirements(
+        new Set(
+          Array.isArray(restored.collapsedRequirementIds)
+            ? restored.collapsedRequirementIds
+            : [],
+        ),
+      );
+      setStoredFileHint(restored.files);
+      await restoreFilesFromHandles(restored.files);
+
+      setHasRestoredWorkspace(true);
+    };
+
+    void restoreWorkspace();
+  }, []);
+
+  useEffect(() => {
+    if (!hasRestoredWorkspace) return;
+
+    writePersistedWorkspace({
+      version: 1,
+      savedAt: new Date().toISOString(),
+      workspaceName: sanitizeWorkspaceName(workspaceName),
+      marks: sanitizeMarksForStorage(marks),
+      panel: {
+        leftWidth,
+        requirementStartPath,
+        isReviewOpen,
+        isReviewPinned,
+        reviewFilter,
+        interactionMode,
+      },
+      catalogLabelOffset,
+      collapsedRequirementIds: Array.from(collapsedRequirements),
+      files: {
+        torName: files.left?.file.name ?? storedFileHint?.torName ?? null,
+        activeEvidenceName:
+          files.right?.file.name ?? storedFileHint?.activeEvidenceName ?? null,
+        evidenceNames: Array.from(
+          new Set([
+            ...(storedFileHint?.evidenceNames ?? []),
+            ...catalogFiles.map((item) => item.file.name),
+            ...marks
+              .filter((mark) => mark.side === "catalog")
+              .map((mark) => mark.fileName),
+          ]),
+        ),
+      },
+    });
+  }, [
+    catalogFiles,
+    catalogLabelOffset,
+    collapsedRequirements,
+    files.left,
+    files.right,
+    hasRestoredWorkspace,
+    interactionMode,
+    isReviewOpen,
+    isReviewPinned,
+    leftWidth,
+    marks,
+    requirementStartPath,
+    reviewFilter,
+    storedFileHint,
+    workspaceName,
+  ]);
 
   useEffect(() => {
     sessionFilesRef.current = { tor: files.left, catalogs: catalogFiles };
@@ -400,7 +922,9 @@ export default function Home() {
     return () => window.removeEventListener("comparex:mark-ready", jumpWhenReady);
   }, [pendingJumpId]);
 
-  const setFileForSlot = (slot: Slot, file: File) => {
+  const setFileForSlot = (slot: Slot, document: SelectedDocument) => {
+    const { file, handle } = document;
+    const url = URL.createObjectURL(file);
     setFiles((current) => {
       if (current[slot]) URL.revokeObjectURL(current[slot].url);
 
@@ -408,13 +932,32 @@ export default function Home() {
         ...current,
         [slot]: {
           file,
-          url: URL.createObjectURL(file),
+          url,
         },
       };
     });
+    setMarks((current) =>
+      current.map((mark) =>
+        mark.side === (slot === "left" ? "tor" : "catalog") &&
+        mark.fileName === file.name
+          ? { ...mark, fileUrl: url }
+          : mark,
+      ),
+    );
+    void saveFileHandle(slot === "left" ? "tor" : `catalog:${file.name}`, file.name, handle);
+    setStoredFileHint((current) => ({
+      torName: slot === "left" ? file.name : (current?.torName ?? null),
+      activeEvidenceName:
+        slot === "right" ? file.name : (current?.activeEvidenceName ?? null),
+      evidenceNames:
+        slot === "right"
+          ? Array.from(new Set([...(current?.evidenceNames ?? []), file.name]))
+          : (current?.evidenceNames ?? []),
+    }));
   };
 
   const clearFileForSlot = (slot: Slot) => {
+    const currentRightName = files.right?.file.name;
     setFiles((current) => {
       if (current[slot]) URL.revokeObjectURL(current[slot].url);
 
@@ -423,10 +966,26 @@ export default function Home() {
         [slot]: null,
       };
     });
+    setStoredFileHint((current) =>
+      current
+        ? {
+            torName: slot === "left" ? null : current.torName,
+            activeEvidenceName:
+              slot === "right" && current.activeEvidenceName === currentRightName
+                ? null
+                : current.activeEvidenceName,
+            evidenceNames:
+              slot === "right" && currentRightName
+                ? current.evidenceNames.filter((name) => name !== currentRightName)
+                : current.evidenceNames,
+          }
+        : current,
+    );
+    void deleteFileHandle(slot === "left" ? "tor" : `catalog:${currentRightName ?? ""}`);
   };
 
-  const addCatalogFiles = (selectedFiles: File[]) => {
-    const additions = selectedFiles.map((file) => ({
+  const addCatalogFiles = (selectedDocuments: SelectedDocument[]) => {
+    const additions = selectedDocuments.map(({ file }) => ({
       file,
       url: URL.createObjectURL(file),
     }));
@@ -436,6 +995,28 @@ export default function Home() {
     setFiles((current) => ({
       ...current,
       right: additions[0],
+    }));
+    setMarks((current) =>
+      current.map((mark) => {
+        if (mark.side !== "catalog") return mark;
+        const matchingFile = additions.find(
+          (item) => item.file.name === mark.fileName,
+        );
+        return matchingFile ? { ...mark, fileUrl: matchingFile.url } : mark;
+      }),
+    );
+    selectedDocuments.forEach(({ file, handle }) => {
+      void saveFileHandle(`catalog:${file.name}`, file.name, handle);
+    });
+    setStoredFileHint((current) => ({
+      torName: current?.torName ?? null,
+      activeEvidenceName: additions[0].file.name,
+      evidenceNames: Array.from(
+        new Set([
+          ...(current?.evidenceNames ?? []),
+          ...additions.map((item) => item.file.name),
+        ]),
+      ),
     }));
   };
 
@@ -457,6 +1038,21 @@ export default function Home() {
           : current.right,
     }));
     URL.revokeObjectURL(item.url);
+    void deleteFileHandle(`catalog:${item.file.name}`);
+    setStoredFileHint((current) =>
+      current
+        ? {
+            ...current,
+            activeEvidenceName:
+              current.activeEvidenceName === item.file.name
+                ? (nextCatalogs[0]?.file.name ?? null)
+                : current.activeEvidenceName,
+            evidenceNames: current.evidenceNames.filter(
+              (name) => name !== item.file.name,
+            ),
+          }
+        : current,
+    );
   };
 
   const clearSession = () => {
@@ -476,6 +1072,9 @@ export default function Home() {
     setCatalogLabelOffset(null);
     setPendingLinkId(null);
     setInteractionMode("highlight");
+    setStoredFileHint(null);
+    clearPersistedWorkspace();
+    void clearFileHandles();
   };
 
   const createEvidenceMark = (
@@ -634,56 +1233,63 @@ export default function Home() {
     const numberParts = normalizedNumber.split(".").map(Number);
     if (numberParts.some((part) => part < 1)) return;
 
-    setMarks((current) => {
-      const torItems = current.filter((item) => item.side === "tor");
-      const flatten = (
-        items: EvidenceMark[],
-        prefix = "",
-      ): Array<{ mark: EvidenceMark; path: string }> =>
-        items.flatMap((item, index) => {
-          const path = prefix ? `${prefix}.${index + 1}` : String(index + 1);
-          const children = torItems.filter((child) => child.parentId === item.id);
-          return [{ mark: item, path }, ...flatten(children, path)];
-        });
-      const flattened = flatten(torItems.filter((item) => !item.parentId));
-      const parentPath = numberParts.slice(0, -1).join(".");
-      const parent = parentPath
-        ? flattened.find((item) => item.path === parentPath)?.mark
-        : undefined;
-      if (parentPath && !parent) return current;
-
-      const byId = new Map(torItems.map((item) => [item.id, item]));
-      let ancestorId = parent?.id;
-      while (ancestorId) {
-        if (ancestorId === mark.id) return current;
-        ancestorId = byId.get(ancestorId)?.parentId;
-      }
-
-      const targetParentId = parent?.id;
-      const targetPosition = numberParts.at(-1)! - 1;
-      const reorderedTor = torItems.filter((item) => item.id !== mark.id);
-      const siblings = reorderedTor.filter(
-        (item) => item.parentId === targetParentId,
-      );
-      const beforeSibling = siblings[targetPosition];
-      let insertionIndex = beforeSibling
-        ? reorderedTor.findIndex((item) => item.id === beforeSibling.id)
-        : reorderedTor.length;
-      if (!beforeSibling && siblings.length) {
-        insertionIndex =
-          reorderedTor.findIndex(
-            (item) => item.id === siblings[siblings.length - 1].id,
-          ) + 1;
-      }
-      reorderedTor.splice(insertionIndex, 0, {
-        ...mark,
-        parentId: targetParentId,
-        requirementNo: undefined,
+    const roots = torMarks.filter(
+      (item) =>
+        !item.parentId ||
+        !torMarks.some((candidate) => candidate.id === item.parentId),
+    );
+    const flattenCurrentNumbers = (
+      items: EvidenceMark[],
+      prefix = "",
+    ): Array<{ mark: EvidenceMark; path: string }> =>
+      items.flatMap((item, index) => {
+        const fallbackPath = prefix
+          ? `${prefix}.${index + 1}`
+          : getRootRequirementPath(requirementStartPath, index);
+        const path = item.requirementNo?.trim() || fallbackPath;
+        const children = torMarks.filter((child) => child.parentId === item.id);
+        return [
+          { mark: item, path },
+          ...flattenCurrentNumbers(children, path),
+        ];
       });
+    const flattened = flattenCurrentNumbers(roots);
+    const currentItem = flattened.find((item) => item.mark.id === mark.id);
+    const currentNumber =
+      currentItem?.path || mark.requirementNo?.trim() || normalizedNumber;
+    const descendants = flattened.filter(
+      (item) =>
+        item.mark.id !== mark.id && item.path.startsWith(`${currentNumber}.`),
+    );
+    const shouldUpdateHierarchy =
+      descendants.length > 0 &&
+      window.confirm(
+        `Change this requirement and ${descendants.length} sub-requirement${descendants.length === 1 ? "" : "s"} from ${currentNumber} to ${normalizedNumber}?`,
+      );
+    const nextNumberById = new Map(
+      shouldUpdateHierarchy
+        ? descendants.map((item) => [
+            item.mark.id,
+            `${normalizedNumber}${item.path.slice(currentNumber.length)}`,
+          ])
+        : [],
+    );
 
-      let torIndex = 0;
+    setMarks((current) => {
+      if (!shouldUpdateHierarchy) {
+        return current.map((item) =>
+          item.id === mark.id
+            ? { ...item, requirementNo: normalizedNumber }
+            : item,
+        );
+      }
+
       return current.map((item) =>
-        item.side === "tor" ? reorderedTor[torIndex++] : item,
+        item.id === mark.id
+          ? { ...item, requirementNo: normalizedNumber }
+          : nextNumberById.has(item.id)
+            ? { ...item, requirementNo: nextNumberById.get(item.id) }
+            : item,
       );
     });
   };
@@ -832,21 +1438,19 @@ export default function Home() {
   const pairedLinkIds = new Set(
     Array.from(linkGroups).filter(([, count]) => count > 1).map(([id]) => id),
   );
-  const linkedCount = marks.filter(
+  const catalogMarks = marks.filter((mark) => mark.side === "catalog");
+  const highlightCount = catalogMarks.length;
+  const linkedCount = catalogMarks.filter(
     (mark) =>
-      mark.side === "catalog" &&
       Boolean(mark.linkId && pairedLinkIds.has(mark.linkId)),
   ).length;
   const torMarks = marks.filter(
     (mark) => mark.side === "tor" && !mark.referenceOnly,
   );
-  const unlinkedCatalogMarks = marks.filter(
-    (mark) => mark.side === "catalog" &&
-      (!mark.linkId || !pairedLinkIds.has(mark.linkId)),
-  );
-  const unlinkedCount = marks.filter(
+  const unlinkedCatalogMarks = catalogMarks.filter(
     (mark) => !mark.linkId || !pairedLinkIds.has(mark.linkId),
-  ).length;
+  );
+  const unlinkedCount = unlinkedCatalogMarks.length;
   const visibleTorMarks = torMarks.filter((mark) => {
     const isPaired = Boolean(mark.linkId && pairedLinkIds.has(mark.linkId));
     if (reviewFilter === "linked") return isPaired;
@@ -863,18 +1467,21 @@ export default function Home() {
     depth = 0,
   ): Array<{ mark: EvidenceMark; path: string; depth: number }> =>
     items.flatMap((mark, index) => {
-      const path = prefix ? `${prefix}.${index + 1}` : String(index + 1);
+      const path = prefix
+        ? `${prefix}.${index + 1}`
+        : getRootRequirementPath(requirementStartPath, index);
       const children = torMarks.filter((item) => item.parentId === mark.id);
       return [
         { mark, path, depth },
         ...flattenRequirements(children, path, depth + 1),
       ];
     });
-  const requirementRows = flattenRequirements(rootRequirements).filter(({ mark }) =>
+  const allRequirementRows = flattenRequirements(rootRequirements);
+  const requirementRows = allRequirementRows.filter(({ mark }) =>
     visibleTorIds.has(mark.id),
   );
   const requirementNumberByLinkId = new Map<string, string>();
-  for (const { mark, path } of flattenRequirements(rootRequirements)) {
+  for (const { mark, path } of allRequirementRows) {
     if (!mark.linkId) continue;
     requirementNumberByLinkId.set(
       mark.linkId,
@@ -906,12 +1513,13 @@ export default function Home() {
       : []),
   ];
 
-  const printAnnotatedEvidence = async () => {
-    const evidenceFile = files.right;
-    if (!evidenceFile || !isPdfFile(evidenceFile.file)) return;
-
-    const annotations = marks.flatMap((mark) => {
-      if (mark.side !== "catalog" || mark.fileUrl !== evidenceFile.url) {
+  const getPrintableEvidenceAnnotations = (evidenceFile: UploadedFile) =>
+    marks.flatMap<PdfAnnotation>((mark) => {
+      if (
+        mark.side !== "catalog" ||
+        (mark.fileUrl && mark.fileUrl !== evidenceFile.url) ||
+        (!mark.fileUrl && mark.fileName !== evidenceFile.file.name)
+      ) {
         return [];
       }
       const anchor = mark.annotation ??
@@ -926,37 +1534,145 @@ export default function Home() {
           }]
         : [];
     });
+
+  const getWorkspaceOutputTitle = (suffix?: string) => {
+    const name = sanitizeWorkspaceName(workspaceName) || "COMPAREX workspace";
+    return suffix ? `${name} - ${suffix}` : name;
+  };
+
+  const openPrintWindow = (message: string, title = getWorkspaceOutputTitle()) => {
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      window.alert("Could not open the print window. Please allow pop-ups and try again.");
+      return null;
+    }
+    printWindow.document.title = title;
+    printWindow.document.body.textContent = message;
+    return printWindow;
+  };
+
+  const printPdfBlob = (printWindow: Window, blob: Blob) => {
+    const printUrl = URL.createObjectURL(blob);
+    printWindow.addEventListener(
+      "load",
+      () => {
+        printWindow.focus();
+        printWindow.print();
+        window.setTimeout(() => URL.revokeObjectURL(printUrl), 60_000);
+      },
+      { once: true },
+    );
+    printWindow.location.replace(printUrl);
+  };
+
+  const mergePdfBlobs = async (pdfBlobs: Blob[], title?: string) => {
+    const { PDFDocument } = await import("pdf-lib");
+    const mergedPdf = await PDFDocument.create();
+    if (title) mergedPdf.setTitle(title);
+    for (const blob of pdfBlobs) {
+      const sourcePdf = await PDFDocument.load(await blob.arrayBuffer());
+      const pages = await mergedPdf.copyPages(
+        sourcePdf,
+        sourcePdf.getPageIndices(),
+      );
+      pages.forEach((page) => mergedPdf.addPage(page));
+    }
+    return new Blob([Uint8Array.from(await mergedPdf.save()).buffer], {
+      type: "application/pdf",
+    });
+  };
+
+  const printAnnotatedEvidence = async () => {
+    const evidenceFile = files.right;
+    if (!evidenceFile || !isPdfFile(evidenceFile.file)) return;
+
+    const annotations = getPrintableEvidenceAnnotations(evidenceFile);
     if (!annotations.length) {
       window.alert("No evidence highlights with a saved position to print.");
       return;
     }
 
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) {
-      window.alert("Could not open the print window. Please allow pop-ups and try again.");
-      return;
-    }
-    printWindow.document.title = "Preparing annotated PDF";
-    printWindow.document.body.textContent = "Preparing annotated PDF for printing…";
+    const outputTitle = getWorkspaceOutputTitle(evidenceFile.file.name.replace(/\.pdf$/i, ""));
+    const printWindow = openPrintWindow(
+      "Preparing annotated PDF for printing...",
+      outputTitle,
+    );
+    if (!printWindow) return;
+
     setIsPrintingEvidence(true);
     try {
-      const exported = await createAnnotatedPdf(evidenceFile.file, annotations);
-      const printUrl = URL.createObjectURL(
-        exported,
+      const exported = await createAnnotatedPdf(
+        evidenceFile.file,
+        annotations,
+        outputTitle,
       );
-      printWindow.addEventListener(
-        "load",
-        () => {
-          printWindow.focus();
-          printWindow.print();
-          window.setTimeout(() => URL.revokeObjectURL(printUrl), 60_000);
-        },
-        { once: true },
+      printPdfBlob(printWindow, exported);
+    } catch (error) {
+      printWindow.close();
+      window.alert(
+        `Could not prepare ${evidenceFile.file.name} for printing: ${getErrorMessage(error)}`,
       );
-      printWindow.location.replace(printUrl);
+    } finally {
+      setIsPrintingEvidence(false);
+    }
+  };
+
+  const printAllAnnotatedEvidence = async () => {
+    if (!printableCatalogFiles.length) {
+      window.alert("No loaded PDF evidence files have printable highlights.");
+      return;
+    }
+
+    const outputTitle = getWorkspaceOutputTitle("Product Evidence");
+    const printWindow = openPrintWindow(
+      `Preparing ${printableCatalogFiles.length} annotated PDF files for printing...`,
+      outputTitle,
+    );
+    if (!printWindow) return;
+
+    setIsPrintingEvidence(true);
+    try {
+      const annotatedPdfs: Blob[] = [];
+      const failedFiles: PrintableFileFailure[] = [];
+
+      for (const item of printableCatalogFiles) {
+        try {
+          annotatedPdfs.push(
+            await createAnnotatedPdf(
+              item.file,
+              getPrintableEvidenceAnnotations(item),
+              getWorkspaceOutputTitle(item.file.name.replace(/\.pdf$/i, "")),
+            ),
+          );
+        } catch (error) {
+          failedFiles.push({
+            fileName: item.file.name,
+            reason: getErrorMessage(error),
+          });
+        }
+      }
+
+      if (!annotatedPdfs.length) {
+        printWindow.close();
+        window.alert(
+          `Could not prepare any annotated PDFs for printing.${failedFiles.length ? ` Failed files: ${failedFiles.map((item) => `${item.fileName}: ${item.reason}`).join("; ")}` : ""}`,
+        );
+        return;
+      }
+
+      const exported =
+        annotatedPdfs.length === 1
+          ? annotatedPdfs[0]
+          : await mergePdfBlobs(annotatedPdfs, outputTitle);
+      printPdfBlob(printWindow, exported);
+      if (failedFiles.length) {
+        window.alert(
+          `Printed ${annotatedPdfs.length} file${annotatedPdfs.length === 1 ? "" : "s"}. Could not prepare: ${failedFiles.map((item) => `${item.fileName}: ${item.reason}`).join("; ")}`,
+        );
+      }
     } catch {
       printWindow.close();
-      window.alert("Could not prepare the annotated PDF for printing. Please try another PDF file.");
+      window.alert("Could not merge the annotated PDFs for printing. Please try fewer files at once.");
     } finally {
       setIsPrintingEvidence(false);
     }
@@ -1139,6 +1855,74 @@ export default function Home() {
     );
   };
 
+  const linkedRequirementOrderByFileName = new Map<
+    string,
+    { order: number; requirementNo: string }
+  >();
+  allRequirementRows.forEach(({ mark, path }, order) => {
+    if (!mark.linkId) return;
+
+    const requirementNo = mark.requirementNo?.trim() || path;
+    marks
+      .filter(
+        (item) => item.side === "catalog" && item.linkId === mark.linkId,
+      )
+      .forEach((item) => {
+        const current = linkedRequirementOrderByFileName.get(item.fileName);
+        if (!current || order < current.order) {
+          linkedRequirementOrderByFileName.set(item.fileName, {
+            order,
+            requirementNo,
+          });
+        }
+      });
+  });
+
+  const baseCatalogFileNames = Array.from(
+    new Set([
+      ...(storedFileHint?.evidenceNames ?? []),
+      ...catalogFiles.map((item) => item.file.name),
+      ...marks
+        .filter((mark) => mark.side === "catalog")
+        .map((mark) => mark.fileName),
+    ]),
+  );
+  const catalogFileIndexByName = new Map(
+    baseCatalogFileNames.map((fileName, index) => [fileName, index]),
+  );
+  const catalogFileNames = [...baseCatalogFileNames].sort((left, right) => {
+    const leftOrder = linkedRequirementOrderByFileName.get(left);
+    const rightOrder = linkedRequirementOrderByFileName.get(right);
+
+    if (leftOrder && rightOrder) {
+      return (
+        leftOrder.order - rightOrder.order ||
+        (catalogFileIndexByName.get(left) ?? 0) -
+          (catalogFileIndexByName.get(right) ?? 0)
+      );
+    }
+
+    if (leftOrder) return -1;
+    if (rightOrder) return 1;
+
+    return (
+      (catalogFileIndexByName.get(left) ?? 0) -
+      (catalogFileIndexByName.get(right) ?? 0)
+    );
+  });
+  const printableCatalogFiles = catalogFileNames.flatMap((fileName) => {
+    const item = catalogFiles.find((catalog) => catalog.file.name === fileName);
+    if (!item || !isPdfFile(item.file)) return [];
+    return getPrintableEvidenceAnnotations(item).length ? [item] : [];
+  });
+  const missingStoredEvidence = catalogFileNames.some(
+    (name) => !catalogFiles.some((item) => item.file.name === name),
+  );
+  const canRestoreFiles = Boolean(
+    storedFileHint &&
+      ((!files.left && storedFileHint.torName) || missingStoredEvidence),
+  );
+
   return (
     <main className={`app-shell ${isReviewPinned ? "review-pinned" : ""}`}>
       <header className="topbar">
@@ -1150,6 +1934,21 @@ export default function Home() {
             priority
           />
         </div>
+
+        <label className="workspace-name-control">
+          <span>Workspace</span>
+          <input
+            type="text"
+            value={workspaceName}
+            onChange={(event) => setWorkspaceName(event.target.value)}
+            onBlur={() =>
+              setWorkspaceName((current) =>
+                sanitizeWorkspaceName(current) || "Untitled workspace",
+              )
+            }
+            aria-label="Workspace name"
+          />
+        </label>
 
         <nav className="toolbar-actions" aria-label="Workspace tools">
           <div className="interaction-mode" role="group" aria-label="Highlight interaction mode">
@@ -1206,14 +2005,26 @@ export default function Home() {
             title="Review highlights"
           >
             <Highlighter aria-hidden="true" size={17} />
-            <span>Highlights {marks.length}</span>
+            <span>Highlights {highlightCount}</span>
+          </button>
+          <span className="toolbar-separator" aria-hidden="true" />
+          <button
+            className="tool-button"
+            type="button"
+            onClick={() => void handleRestoreFiles()}
+            disabled={!canRestoreFiles || isRestoringFiles}
+            aria-label="Restore saved document file access"
+            title="Restore files"
+          >
+            <FilesIcon aria-hidden="true" size={17} />
+            <span>{isRestoringFiles ? "Restoring..." : "Restore files"}</span>
           </button>
           <span className="toolbar-separator" aria-hidden="true" />
           <button
             className="tool-button danger-tool"
             type="button"
             onClick={clearSession}
-            disabled={!files.left && !catalogFiles.length}
+            disabled={!files.left && !catalogFiles.length && !marks.length}
             aria-label="Remove both documents"
             title="Clear session"
           >
@@ -1230,6 +2041,18 @@ export default function Home() {
           <span>Local session</span>
         </div>
       </header>
+      {restoreMessage ? (
+        <div className="restore-file-status" role="status">
+          {restoreMessage}
+          <button
+            type="button"
+            onClick={() => setRestoreMessage("")}
+            aria-label="Dismiss restore status"
+          >
+            <X aria-hidden="true" size={14} />
+          </button>
+        </div>
+      ) : null}
 
       <section
         ref={workspaceRef}
@@ -1241,7 +2064,7 @@ export default function Home() {
           title="TOR / Requirements"
           tone="version-a"
           uploadedFile={files.left}
-          onSelect={(selectedFiles) => setFileForSlot("left", selectedFiles[0])}
+          onSelect={(documents) => setFileForSlot("left", documents[0])}
           onClear={() => clearFileForSlot("left")}
           previewProps={{
             side: "tor",
@@ -1331,14 +2154,14 @@ export default function Home() {
               >
                 <summary title="All Product Evidence documents">
                   <FilesIcon aria-hidden="true" size={15} />
-                  <span>Files {catalogFiles.length}</span>
+                  <span>Files {catalogFileNames.length}</span>
                   <ChevronDown aria-hidden="true" size={14} />
                 </summary>
                 <div className="catalog-popover">
                   <div className="catalog-popover-heading">
                     <div>
                       <strong>Product Evidence</strong>
-                      <span>{catalogFiles.length} documents</span>
+                      <span>{catalogFileNames.length} documents</span>
                     </div>
                     <button
                       type="button"
@@ -1350,45 +2173,63 @@ export default function Home() {
                   </div>
 
                   <div className="catalog-list">
-                    {catalogFiles.length ? (
-                      catalogFiles.map((item) => (
-                        <div
-                          className={`catalog-row ${
-                            files.right?.url === item.url ? "active" : ""
-                          }`}
-                          key={item.url}
-                        >
-                          <button
-                            className="catalog-row-main"
-                            type="button"
-                            onClick={() => {
-                              setFiles((current) => ({
-                                ...current,
-                                right: item,
-                              }));
-                              setIsCatalogMenuOpen(false);
-                            }}
+                    {catalogFileNames.length ? (
+                      catalogFileNames.map((fileName) => {
+                        const item = catalogFiles.find(
+                          (catalog) => catalog.file.name === fileName,
+                        );
+                        const linkedRequirement =
+                          linkedRequirementOrderByFileName.get(fileName);
+                        const fileStatus = item
+                          ? `${isPdfFile(item.file) ? "PDF" : "DOCX"} · ${formatFileSize(item.file.size)}`
+                          : "Waiting for file permission";
+
+                        return (
+                          <div
+                            className={`catalog-row ${
+                              item && files.right?.url === item.url ? "active" : ""
+                            } ${item ? "" : "pending"}`}
+                            key={item?.url ?? fileName}
                           >
-                            <FileText aria-hidden="true" size={18} />
-                            <span>
-                              <strong>{item.file.name}</strong>
-                              <small>
-                                {isPdfFile(item.file) ? "PDF" : "DOCX"} ·{" "}
-                                {formatFileSize(item.file.size)}
-                              </small>
-                            </span>
-                          </button>
-                          <button
-                            className="catalog-row-remove"
-                            type="button"
-                            onClick={() => removeCatalogFile(item)}
-                            aria-label={`Remove ${item.file.name}`}
-                            title="Remove document"
-                          >
-                            <Trash2 aria-hidden="true" size={15} />
-                          </button>
-                        </div>
-                      ))
+                            <button
+                              className="catalog-row-main"
+                              type="button"
+                              onClick={() => {
+                                if (!item) {
+                                  void handleRestoreFiles();
+                                  return;
+                                }
+                                setFiles((current) => ({
+                                  ...current,
+                                  right: item,
+                                }));
+                                setIsCatalogMenuOpen(false);
+                              }}
+                            >
+                              <FileText aria-hidden="true" size={18} />
+                              <span>
+                                <strong>{fileName}</strong>
+                                <small>
+                                  {linkedRequirement
+                                    ? `${fileStatus} · Req ${linkedRequirement.requirementNo}`
+                                    : fileStatus}
+                                </small>
+                              </span>
+                            </button>
+                            {item ? (
+                              <button
+                                className="catalog-row-remove"
+                                type="button"
+                                onClick={() => removeCatalogFile(item)}
+                                aria-label={`Remove ${item.file.name}`}
+                                title="Remove document"
+                              >
+                                <Trash2 aria-hidden="true" size={15} />
+                              </button>
+                            ) : null}
+                          </div>
+                        );
+                      })
                     ) : (
                       <p className="catalog-empty">No evidence documents yet</p>
                     )}
@@ -1397,7 +2238,7 @@ export default function Home() {
                   <button
                     className="catalog-add-button"
                     type="button"
-                    onClick={() => catalogPickerRef.current?.click()}
+                    onClick={() => void openCatalogPicker()}
                   >
                     <Plus aria-hidden="true" size={16} />
                     Add documents
@@ -1408,7 +2249,7 @@ export default function Home() {
               <button
                 className="catalog-quick-add"
                 type="button"
-                onClick={() => catalogPickerRef.current?.click()}
+                onClick={() => void openCatalogPicker()}
                 aria-label="Add Product Evidence documents"
                 title="Add documents"
               >
@@ -1425,7 +2266,8 @@ export default function Home() {
                   !marks.some(
                     (mark) =>
                       mark.side === "catalog" &&
-                      mark.fileUrl === files.right?.url &&
+                      ((mark.fileUrl && mark.fileUrl === files.right?.url) ||
+                        (!mark.fileUrl && mark.fileName === files.right?.file.name)) &&
                       Boolean(mark.linkId && requirementNumberByLinkId.has(mark.linkId)),
                   )
                 }
@@ -1433,6 +2275,17 @@ export default function Home() {
                 title="Print annotated PDF"
               >
                 <Printer aria-hidden="true" size={16} />
+              </button>
+              <button
+                className="catalog-print-button print-all-button"
+                type="button"
+                onClick={() => void printAllAnnotatedEvidence()}
+                disabled={isPrintingEvidence || !printableCatalogFiles.length}
+                aria-label="Print all annotated Product Evidence PDFs"
+                title="Print all annotated PDFs"
+              >
+                <Printer aria-hidden="true" size={16} />
+                <span>All</span>
               </button>
               <input
                 ref={catalogPickerRef}
@@ -1443,7 +2296,9 @@ export default function Home() {
                 onChange={(event) => {
                   const selected = Array.from(event.target.files ?? []);
                   const accepted = selected.filter(isAcceptedFile);
-                  if (accepted.length) addCatalogFiles(accepted);
+                  if (accepted.length) {
+                    addCatalogFiles(accepted.map((file) => ({ file })));
+                  }
                   event.target.value = "";
                 }}
               />
@@ -1475,7 +2330,7 @@ export default function Home() {
         <header>
           <div className="review-rail-title">
             <strong>Review highlights</strong>
-            <span>{torMarks.length} requirements · {marks.length} highlights</span>
+            <span>{torMarks.length} requirements · {highlightCount} highlights</span>
           </div>
           <div className="review-rail-actions">
             <button
@@ -1515,7 +2370,7 @@ export default function Home() {
               onClick={() => setReviewFilter(filter)}
             >
               {filter === "all"
-                ? `All ${marks.length}`
+                ? `All ${highlightCount}`
                 : filter === "unlinked"
                   ? `Unlinked ${unlinkedCount}`
                   : `Linked ${linkedCount}`}
@@ -1525,6 +2380,23 @@ export default function Home() {
         <div className="review-list">
           <div className="requirement-list-toolbar">
             <strong>Requirements</strong>
+            <label className="requirement-start-control">
+              <span>Start no.</span>
+              <input
+                type="text"
+                inputMode="decimal"
+                pattern="\\d+(\\.\\d+)*"
+                value={requirementStartPath}
+                onChange={(event) => {
+                  setRequirementStartPath(event.target.value);
+                }}
+                onBlur={() =>
+                  setRequirementStartPath((current) =>
+                    normalizeRequirementStartPath(current),
+                  )
+                }
+              />
+            </label>
             <button
               type="button"
               onClick={() => setRequirementComposer({ parentId: null, value: "" })}
