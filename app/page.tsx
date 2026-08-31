@@ -15,7 +15,7 @@ import Image from "next/image";
 import {
   ChevronDown,
   ChevronRight,
-  Columns2,
+  Download,
   FileText,
   Files as FilesIcon,
   GripVertical,
@@ -24,7 +24,6 @@ import {
   Pin,
   PinOff,
   Plus,
-  Printer,
   ShieldCheck,
   Trash2,
   Unlink2,
@@ -117,6 +116,8 @@ type PersistedWorkspaceState = {
     requirementStartPath?: string;
     isReviewOpen: boolean;
     isReviewPinned: boolean;
+    showTorPane?: boolean;
+    showEvidencePane?: boolean;
     reviewFilter: ReviewFilter;
     interactionMode: "highlight" | "link";
   };
@@ -317,6 +318,7 @@ async function getDroppedDocuments(event: DragEvent<HTMLDivElement>) {
 }
 
 function DropPanel({
+  id,
   title,
   tone,
   uploadedFile,
@@ -326,6 +328,7 @@ function DropPanel({
   toolbar,
   previewProps,
 }: {
+  id?: string;
   title: string;
   tone: "version-a" | "version-b";
   uploadedFile: UploadedFile | null;
@@ -426,6 +429,7 @@ function DropPanel({
 
   return (
     <section
+      id={id}
       className={`drop-panel ${tone} ${toolbar ? "has-panel-toolbar" : ""}`}
       aria-label={title}
     >
@@ -614,7 +618,7 @@ export default function Home() {
   const [isResizing, setIsResizing] = useState(false);
   const [catalogFiles, setCatalogFiles] = useState<UploadedFile[]>([]);
   const [isCatalogMenuOpen, setIsCatalogMenuOpen] = useState(false);
-  const [isPrintingEvidence, setIsPrintingEvidence] = useState(false);
+  const [isDownloadingEvidence, setIsDownloadingEvidence] = useState(false);
   const [marks, setMarks] = useState<EvidenceMark[]>([]);
   const [catalogLabelOffset, setCatalogLabelOffset] = useState<{
     x: number;
@@ -623,6 +627,8 @@ export default function Home() {
   const [pendingLinkId, setPendingLinkId] = useState<string | null>(null);
   const [isReviewOpen, setIsReviewOpen] = useState(false);
   const [isReviewPinned, setIsReviewPinned] = useState(false);
+  const [showTorPane, setShowTorPane] = useState(true);
+  const [showEvidencePane, setShowEvidencePane] = useState(true);
   const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("all");
   const [dragOverTorId, setDragOverTorId] = useState<string | null>(null);
   const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
@@ -806,6 +812,8 @@ export default function Home() {
       );
       setIsReviewOpen(Boolean(restored.panel?.isReviewOpen));
       setIsReviewPinned(Boolean(restored.panel?.isReviewPinned));
+      setShowTorPane(restored.panel?.showTorPane ?? true);
+      setShowEvidencePane(restored.panel?.showEvidencePane ?? true);
       setReviewFilter(safeReviewFilter(restored.panel?.reviewFilter));
       setInteractionMode(safeInteractionMode(restored.panel?.interactionMode));
       setCatalogLabelOffset(restored.catalogLabelOffset ?? null);
@@ -838,6 +846,8 @@ export default function Home() {
         requirementStartPath,
         isReviewOpen,
         isReviewPinned,
+        showTorPane,
+        showEvidencePane,
         reviewFilter,
         interactionMode,
       },
@@ -868,6 +878,8 @@ export default function Home() {
     interactionMode,
     isReviewOpen,
     isReviewPinned,
+    showTorPane,
+    showEvidencePane,
     leftWidth,
     marks,
     requirementStartPath,
@@ -1053,28 +1065,6 @@ export default function Home() {
           }
         : current,
     );
-  };
-
-  const clearSession = () => {
-    if (!window.confirm("Remove the TOR and all Product Evidence files?")) {
-      return;
-    }
-
-    setFiles((current) => {
-      if (current.left) URL.revokeObjectURL(current.left.url);
-
-      return { left: null, right: null };
-    });
-    catalogFiles.forEach((item) => URL.revokeObjectURL(item.url));
-    setCatalogFiles([]);
-    setIsCatalogMenuOpen(false);
-    setMarks([]);
-    setCatalogLabelOffset(null);
-    setPendingLinkId(null);
-    setInteractionMode("highlight");
-    setStoredFileHint(null);
-    clearPersistedWorkspace();
-    void clearFileHandles();
   };
 
   const createEvidenceMark = (
@@ -1480,13 +1470,44 @@ export default function Home() {
   const requirementRows = allRequirementRows.filter(({ mark }) =>
     visibleTorIds.has(mark.id),
   );
+  const requirementRowById = new Map(
+    allRequirementRows.map((row) => [row.mark.id, row]),
+  );
+  const getRootRequirementRow = (mark: EvidenceMark) => {
+    let currentRow = requirementRowById.get(mark.id);
+    const visitedIds = new Set<string>();
+
+    while (
+      currentRow?.mark.parentId &&
+      !visitedIds.has(currentRow.mark.parentId)
+    ) {
+      visitedIds.add(currentRow.mark.id);
+      const parentRow = requirementRowById.get(currentRow.mark.parentId);
+      if (!parentRow) break;
+      currentRow = parentRow;
+    }
+
+    return currentRow;
+  };
   const requirementNumberByLinkId = new Map<string, string>();
+  const rootRequirementDetailsByLinkId = new Map<
+    string,
+    { requirementNo: string; text: string }
+  >();
   for (const { mark, path } of allRequirementRows) {
     if (!mark.linkId) continue;
-    requirementNumberByLinkId.set(
-      mark.linkId,
-      mark.requirementNo?.trim() || path,
-    );
+    const requirementNo = mark.requirementNo?.trim() || path;
+    const rootRequirement = getRootRequirementRow(mark);
+    const rootRequirementNo =
+      rootRequirement?.mark.requirementNo?.trim() || rootRequirement?.path;
+
+    requirementNumberByLinkId.set(mark.linkId, requirementNo);
+    if (rootRequirementNo && rootRequirement) {
+      rootRequirementDetailsByLinkId.set(mark.linkId, {
+        requirementNo: rootRequirementNo,
+        text: rootRequirement.mark.text.trim(),
+      });
+    }
   }
   const showUnlinkedEvidence = reviewFilter !== "linked";
   const gridRows: RequirementGridRow[] = [
@@ -1535,34 +1556,72 @@ export default function Home() {
         : [];
     });
 
+  const compareRequirementNumbers = (left: string, right: string) => {
+    const leftParts = left.split(".");
+    const rightParts = right.split(".");
+    const partCount = Math.max(leftParts.length, rightParts.length);
+
+    for (let index = 0; index < partCount; index += 1) {
+      const leftPart = leftParts[index] ?? "0";
+      const rightPart = rightParts[index] ?? "0";
+      const leftNumber = Number(leftPart);
+      const rightNumber = Number(rightPart);
+
+      if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+        if (leftNumber !== rightNumber) return leftNumber - rightNumber;
+        continue;
+      }
+
+      const fallbackComparison = leftPart.localeCompare(rightPart, undefined, {
+        numeric: true,
+      });
+      if (fallbackComparison !== 0) return fallbackComparison;
+    }
+
+    return 0;
+  };
+
+  const getLargestLinkedRequirementLabel = (annotations: PdfAnnotation[]) =>
+    annotations.reduce<string | null>((largest, annotation) => {
+      const linkId = annotation.mark.linkId;
+      if (!linkId) return largest;
+      const requirement = rootRequirementDetailsByLinkId.get(linkId);
+      if (!requirement) return largest;
+      const requirementNo = requirement.requirementNo.trim();
+      if (!requirementNo) return largest;
+      const label = `${requirementNo} ${requirement.text}`.trim();
+      if (!largest) return label;
+      return compareRequirementNumbers(requirementNo, largest.split(" ")[0] ?? "") > 0
+        ? label
+        : largest;
+    }, null);
+
   const getWorkspaceOutputTitle = (suffix?: string) => {
     const name = sanitizeWorkspaceName(workspaceName) || "COMPAREX workspace";
     return suffix ? `${name} - ${suffix}` : name;
   };
 
-  const openPrintWindow = (message: string, title = getWorkspaceOutputTitle()) => {
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) {
-      window.alert("Could not open the print window. Please allow pop-ups and try again.");
-      return null;
-    }
-    printWindow.document.title = title;
-    printWindow.document.body.textContent = message;
-    return printWindow;
+  const getOutputFileName = (title: string) => {
+    const cleaned = title
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return `${cleaned || "COMPAREX annotated evidence"}.pdf`;
   };
 
-  const printPdfBlob = (printWindow: Window, blob: Blob) => {
-    const printUrl = URL.createObjectURL(blob);
-    printWindow.addEventListener(
-      "load",
-      () => {
-        printWindow.focus();
-        printWindow.print();
-        window.setTimeout(() => URL.revokeObjectURL(printUrl), 60_000);
-      },
-      { once: true },
+  const downloadPdfBlob = (blob: Blob, title = getWorkspaceOutputTitle()) => {
+    const fileName = getOutputFileName(title);
+    const downloadUrl = URL.createObjectURL(
+      new File([blob], fileName, { type: "application/pdf" }),
     );
-    printWindow.location.replace(printUrl);
+    const link = document.createElement("a");
+    link.href = downloadUrl;
+    link.download = fileName;
+    link.rel = "noopener";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 60_000);
   };
 
   const mergePdfBlobs = async (pdfBlobs: Blob[], title?: string) => {
@@ -1582,60 +1641,51 @@ export default function Home() {
     });
   };
 
-  const printAnnotatedEvidence = async () => {
+  const downloadAnnotatedEvidence = async () => {
     const evidenceFile = files.right;
     if (!evidenceFile || !isPdfFile(evidenceFile.file)) return;
 
     const annotations = getPrintableEvidenceAnnotations(evidenceFile);
     if (!annotations.length) {
-      window.alert("No evidence highlights with a saved position to print.");
+      window.alert("No evidence highlights with a saved position to download.");
       return;
     }
 
-    const outputTitle = getWorkspaceOutputTitle(evidenceFile.file.name.replace(/\.pdf$/i, ""));
-    const printWindow = openPrintWindow(
-      "Preparing annotated PDF for printing...",
-      outputTitle,
-    );
-    if (!printWindow) return;
+    const outputTitle =
+      getLargestLinkedRequirementLabel(annotations) ??
+      getWorkspaceOutputTitle(evidenceFile.file.name.replace(/\.pdf$/i, ""));
 
-    setIsPrintingEvidence(true);
+    setIsDownloadingEvidence(true);
     try {
       const exported = await createAnnotatedPdf(
         evidenceFile.file,
         annotations,
         outputTitle,
       );
-      printPdfBlob(printWindow, exported);
+      downloadPdfBlob(exported, outputTitle);
     } catch (error) {
-      printWindow.close();
       window.alert(
-        `Could not prepare ${evidenceFile.file.name} for printing: ${getErrorMessage(error)}`,
+        `Could not prepare ${evidenceFile.file.name} for download: ${getErrorMessage(error)}`,
       );
     } finally {
-      setIsPrintingEvidence(false);
+      setIsDownloadingEvidence(false);
     }
   };
 
-  const printAllAnnotatedEvidence = async () => {
-    if (!printableCatalogFiles.length) {
-      window.alert("No loaded PDF evidence files have printable highlights.");
+  const downloadAllAnnotatedEvidence = async () => {
+    if (!downloadableCatalogFiles.length) {
+      window.alert("No loaded PDF evidence files have downloadable highlights.");
       return;
     }
 
     const outputTitle = getWorkspaceOutputTitle("Product Evidence");
-    const printWindow = openPrintWindow(
-      `Preparing ${printableCatalogFiles.length} annotated PDF files for printing...`,
-      outputTitle,
-    );
-    if (!printWindow) return;
 
-    setIsPrintingEvidence(true);
+    setIsDownloadingEvidence(true);
     try {
       const annotatedPdfs: Blob[] = [];
       const failedFiles: PrintableFileFailure[] = [];
 
-      for (const item of printableCatalogFiles) {
+      for (const item of downloadableCatalogFiles) {
         try {
           annotatedPdfs.push(
             await createAnnotatedPdf(
@@ -1653,9 +1703,8 @@ export default function Home() {
       }
 
       if (!annotatedPdfs.length) {
-        printWindow.close();
         window.alert(
-          `Could not prepare any annotated PDFs for printing.${failedFiles.length ? ` Failed files: ${failedFiles.map((item) => `${item.fileName}: ${item.reason}`).join("; ")}` : ""}`,
+          `Could not prepare any annotated PDFs for download.${failedFiles.length ? ` Failed files: ${failedFiles.map((item) => `${item.fileName}: ${item.reason}`).join("; ")}` : ""}`,
         );
         return;
       }
@@ -1664,17 +1713,16 @@ export default function Home() {
         annotatedPdfs.length === 1
           ? annotatedPdfs[0]
           : await mergePdfBlobs(annotatedPdfs, outputTitle);
-      printPdfBlob(printWindow, exported);
+      downloadPdfBlob(exported, outputTitle);
       if (failedFiles.length) {
         window.alert(
-          `Printed ${annotatedPdfs.length} file${annotatedPdfs.length === 1 ? "" : "s"}. Could not prepare: ${failedFiles.map((item) => `${item.fileName}: ${item.reason}`).join("; ")}`,
+          `Downloaded ${annotatedPdfs.length} file${annotatedPdfs.length === 1 ? "" : "s"}. Could not prepare: ${failedFiles.map((item) => `${item.fileName}: ${item.reason}`).join("; ")}`,
         );
       }
     } catch {
-      printWindow.close();
-      window.alert("Could not merge the annotated PDFs for printing. Please try fewer files at once.");
+      window.alert("Could not merge the annotated PDFs for download. Please try fewer files at once.");
     } finally {
-      setIsPrintingEvidence(false);
+      setIsDownloadingEvidence(false);
     }
   };
 
@@ -1910,18 +1958,18 @@ export default function Home() {
       (catalogFileIndexByName.get(right) ?? 0)
     );
   });
-  const printableCatalogFiles = catalogFileNames.flatMap((fileName) => {
+  const downloadableCatalogFiles = catalogFileNames.flatMap((fileName) => {
     const item = catalogFiles.find((catalog) => catalog.file.name === fileName);
     if (!item || !isPdfFile(item.file)) return [];
     return getPrintableEvidenceAnnotations(item).length ? [item] : [];
   });
-  const missingStoredEvidence = catalogFileNames.some(
-    (name) => !catalogFiles.some((item) => item.file.name === name),
-  );
-  const canRestoreFiles = Boolean(
-    storedFileHint &&
-      ((!files.left && storedFileHint.torName) || missingStoredEvidence),
-  );
+  const visibleDocumentPaneCount = Number(showTorPane) + Number(showEvidencePane);
+  const workspaceVisibilityClass =
+    visibleDocumentPaneCount === 0
+      ? "no-document-panes"
+      : visibleDocumentPaneCount === 1
+        ? "one-pane"
+        : "";
 
   return (
     <main className={`app-shell ${isReviewPinned ? "review-pinned" : ""}`}>
@@ -1936,7 +1984,7 @@ export default function Home() {
         </div>
 
         <label className="workspace-name-control">
-          <span>Workspace</span>
+          <span>Project Name</span>
           <input
             type="text"
             value={workspaceName}
@@ -1978,18 +2026,6 @@ export default function Home() {
           </div>
           <span className="toolbar-separator" aria-hidden="true" />
           <button
-            className="tool-button"
-            type="button"
-            onClick={() => setLeftWidth(50)}
-            disabled={leftWidth === 50}
-            aria-label="Make document panels equal width"
-            title="Equal panes"
-          >
-            <Columns2 aria-hidden="true" size={17} />
-            <span>Equal panes</span>
-          </button>
-          <span className="toolbar-separator" aria-hidden="true" />
-          <button
             className={`tool-button ${isReviewOpen ? "active-tool" : ""}`}
             type="button"
             onClick={() => {
@@ -2007,29 +2043,39 @@ export default function Home() {
             <Highlighter aria-hidden="true" size={17} />
             <span>Highlights {highlightCount}</span>
           </button>
+          <button
+            className={`tool-button ${showTorPane ? "active-tool" : ""}`}
+            type="button"
+            onClick={() => setShowTorPane((current) => !current)}
+            aria-pressed={showTorPane}
+            aria-controls="tor-panel"
+            title={showTorPane ? "Hide TOR panel" : "Show TOR panel"}
+          >
+            <FileText aria-hidden="true" size={17} />
+            <span>TOR</span>
+          </button>
+          <button
+            className={`tool-button ${showEvidencePane ? "active-tool" : ""}`}
+            type="button"
+            onClick={() => setShowEvidencePane((current) => !current)}
+            aria-pressed={showEvidencePane}
+            aria-controls="evidence-panel"
+            title={showEvidencePane ? "Hide Product Evidence panel" : "Show Product Evidence panel"}
+          >
+            <FilesIcon aria-hidden="true" size={17} />
+            <span>Evidence</span>
+          </button>
           <span className="toolbar-separator" aria-hidden="true" />
           <button
             className="tool-button"
             type="button"
-            onClick={() => void handleRestoreFiles()}
-            disabled={!canRestoreFiles || isRestoringFiles}
-            aria-label="Restore saved document file access"
-            title="Restore files"
+            onClick={() => void downloadAllAnnotatedEvidence()}
+            disabled={isDownloadingEvidence || !downloadableCatalogFiles.length}
+            aria-label="Download all annotated Product Evidence PDFs"
+            title="Download all annotated PDFs"
           >
-            <FilesIcon aria-hidden="true" size={17} />
-            <span>{isRestoringFiles ? "Restoring..." : "Restore files"}</span>
-          </button>
-          <span className="toolbar-separator" aria-hidden="true" />
-          <button
-            className="tool-button danger-tool"
-            type="button"
-            onClick={clearSession}
-            disabled={!files.left && !catalogFiles.length && !marks.length}
-            aria-label="Remove both documents"
-            title="Clear session"
-          >
-            <Trash2 aria-hidden="true" size={17} />
-            <span>Clear</span>
+            <Download aria-hidden="true" size={17} />
+            <span>{isDownloadingEvidence ? "Downloading..." : "Download all"}</span>
           </button>
         </nav>
 
@@ -2056,88 +2102,95 @@ export default function Home() {
 
       <section
         ref={workspaceRef}
-        className={`workspace ${isResizing ? "resizing" : ""}`}
+        className={`workspace ${isResizing ? "resizing" : ""} ${workspaceVisibilityClass}`}
         aria-label="Document upload workspace"
         style={{ "--left-panel-width": `${leftWidth}%` } as React.CSSProperties}
       >
-        <DropPanel
-          title="TOR / Requirements"
-          tone="version-a"
-          uploadedFile={files.left}
-          onSelect={(documents) => setFileForSlot("left", documents[0])}
-          onClear={() => clearFileForSlot("left")}
-          previewProps={{
-            side: "tor",
-            pendingLinkId,
-            interactionMode,
-            marks: marks.filter(
-              (mark) => mark.side === "tor" && mark.fileName === files.left?.file.name,
-            ),
-            onCreateMark: createEvidenceMark,
-            onMoveMark: (id, labelPosition) =>
-              setMarks((current) =>
-                current.map((mark) =>
-                  mark.id === id ? { ...mark, labelPosition } : mark,
-                ),
+        {showTorPane ? (
+          <DropPanel
+            id="tor-panel"
+            title="TOR / Requirements"
+            tone="version-a"
+            uploadedFile={files.left}
+            onSelect={(documents) => setFileForSlot("left", documents[0])}
+            onClear={() => clearFileForSlot("left")}
+            previewProps={{
+              side: "tor",
+              pendingLinkId,
+              interactionMode,
+              marks: marks.filter(
+                (mark) => mark.side === "tor" && mark.fileName === files.left?.file.name,
               ),
-          }}
-        />
-        <div
-          className="panel-splitter"
-          role="separator"
-          aria-label="Resize document panels"
-          aria-orientation="vertical"
-          aria-valuemin={20}
-          aria-valuemax={80}
-          aria-valuenow={Math.round(leftWidth)}
-          tabIndex={0}
-          onPointerDown={(event) => {
-            event.currentTarget.setPointerCapture(event.pointerId);
-            setIsResizing(true);
-          }}
-          onPointerMove={resizePanels}
-          onPointerUp={(event) => {
-            event.currentTarget.releasePointerCapture(event.pointerId);
-            setIsResizing(false);
-          }}
-          onPointerCancel={() => setIsResizing(false)}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-              event.preventDefault();
-              const direction = event.key === "ArrowLeft" ? -2 : 2;
-              setLeftWidth((current) =>
-                Math.min(80, Math.max(20, current + direction)),
-              );
-            }
-          }}
-        >
-          <span aria-hidden="true" />
-        </div>
-        <DropPanel
-          title="Product Evidence"
-          tone="version-b"
-          multiple
-          uploadedFile={files.right}
-          onSelect={addCatalogFiles}
-          previewProps={{
-            side: "catalog",
-            pendingLinkId,
-            interactionMode,
-            marks: marks.filter(
-              (mark) => mark.side === "catalog" && mark.fileName === files.right?.file.name,
-            ),
-            requirementNumberByLinkId,
-            onMoveMark: (id, labelPosition, labelOffset) => {
-              setCatalogLabelOffset(labelOffset);
-              setMarks((current) =>
-                current.map((mark) =>
-                  mark.id === id ? { ...mark, labelPosition } : mark,
+              onCreateMark: createEvidenceMark,
+              onMoveMark: (id, labelPosition) =>
+                setMarks((current) =>
+                  current.map((mark) =>
+                    mark.id === id ? { ...mark, labelPosition } : mark,
+                  ),
                 ),
-              );
-            },
-            onCreateMark: createEvidenceMark,
-          }}
-          toolbar={
+            }}
+          />
+        ) : null}
+        {showTorPane && showEvidencePane ? (
+          <div
+            className="panel-splitter"
+            role="separator"
+            aria-label="Resize document panels"
+            aria-orientation="vertical"
+            aria-valuemin={20}
+            aria-valuemax={80}
+            aria-valuenow={Math.round(leftWidth)}
+            tabIndex={0}
+            onPointerDown={(event) => {
+              event.currentTarget.setPointerCapture(event.pointerId);
+              setIsResizing(true);
+            }}
+            onPointerMove={resizePanels}
+            onPointerUp={(event) => {
+              event.currentTarget.releasePointerCapture(event.pointerId);
+              setIsResizing(false);
+            }}
+            onPointerCancel={() => setIsResizing(false)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                event.preventDefault();
+                const direction = event.key === "ArrowLeft" ? -2 : 2;
+                setLeftWidth((current) =>
+                  Math.min(80, Math.max(20, current + direction)),
+                );
+              }
+            }}
+          >
+            <span aria-hidden="true" />
+          </div>
+        ) : null}
+        {showEvidencePane ? (
+          <DropPanel
+            id="evidence-panel"
+            title="Product Evidence"
+            tone="version-b"
+            multiple
+            uploadedFile={files.right}
+            onSelect={addCatalogFiles}
+            previewProps={{
+              side: "catalog",
+              pendingLinkId,
+              interactionMode,
+              marks: marks.filter(
+                (mark) => mark.side === "catalog" && mark.fileName === files.right?.file.name,
+              ),
+              requirementNumberByLinkId,
+              onMoveMark: (id, labelPosition, labelOffset) => {
+                setCatalogLabelOffset(labelOffset);
+                setMarks((current) =>
+                  current.map((mark) =>
+                    mark.id === id ? { ...mark, labelPosition } : mark,
+                  ),
+                );
+              },
+              onCreateMark: createEvidenceMark,
+            }}
+            toolbar={
             <div className="catalog-toolbar">
               <div className="catalog-title" title={files.right?.file.name}>
                 <FileText aria-hidden="true" size={15} />
@@ -2256,11 +2309,11 @@ export default function Home() {
                 <Plus aria-hidden="true" size={16} />
               </button>
               <button
-                className="catalog-print-button"
+                className="catalog-download-button"
                 type="button"
-                onClick={() => void printAnnotatedEvidence()}
+                onClick={() => void downloadAnnotatedEvidence()}
                 disabled={
-                  isPrintingEvidence ||
+                  isDownloadingEvidence ||
                   !files.right ||
                   !isPdfFile(files.right.file) ||
                   !marks.some(
@@ -2271,21 +2324,10 @@ export default function Home() {
                       Boolean(mark.linkId && requirementNumberByLinkId.has(mark.linkId)),
                   )
                 }
-                aria-label="Print annotated Product Evidence PDF"
-                title="Print annotated PDF"
+                aria-label="Download annotated Product Evidence PDF"
+                title="Download annotated PDF"
               >
-                <Printer aria-hidden="true" size={16} />
-              </button>
-              <button
-                className="catalog-print-button print-all-button"
-                type="button"
-                onClick={() => void printAllAnnotatedEvidence()}
-                disabled={isPrintingEvidence || !printableCatalogFiles.length}
-                aria-label="Print all annotated Product Evidence PDFs"
-                title="Print all annotated PDFs"
-              >
-                <Printer aria-hidden="true" size={16} />
-                <span>All</span>
+                <Download aria-hidden="true" size={16} />
               </button>
               <input
                 ref={catalogPickerRef}
@@ -2303,8 +2345,15 @@ export default function Home() {
                 }}
               />
             </div>
-          }
-        />
+            }
+          />
+        ) : null}
+        {!showTorPane && !showEvidencePane ? (
+          <div className="workspace-empty-state" role="status">
+            <strong>No document panes shown</strong>
+            <span>Use the TOR or Evidence buttons in the toolbar to show a pane.</span>
+          </div>
+        ) : null}
       </section>
       {interactionMode === "link" ? (
         <div className="link-mode-status" role="status">

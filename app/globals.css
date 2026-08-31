@@ -286,6 +286,34 @@ button:disabled {
   user-select: none;
 }
 
+.workspace.one-pane,
+.workspace.no-document-panes {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.workspace-empty-state {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+  border-top: 3px solid #334155;
+  color: #94a3b8;
+  text-align: center;
+}
+
+.workspace-empty-state strong {
+  color: #e2e8f0;
+  font-size: 1rem;
+}
+
+.workspace-empty-state span {
+  max-width: 360px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
 .drop-panel {
   position: relative;
   display: grid;
@@ -357,7 +385,7 @@ button:disabled {
 }
 
 .catalog-quick-add:focus-visible,
-.catalog-print-button:focus-visible,
+.catalog-download-button:focus-visible,
 .catalog-switcher summary:focus-visible {
   outline: 2px solid #3b82f6;
   outline-offset: 1px;
@@ -434,7 +462,7 @@ button:disabled {
 .catalog-popover-heading button,
 .catalog-row-remove,
 .catalog-quick-add,
-.catalog-print-button {
+.catalog-download-button {
   display: inline-grid;
   place-items: center;
   width: 32px;
@@ -551,28 +579,14 @@ button:disabled {
   background: #1e293b;
 }
 
-.catalog-print-button {
+.catalog-download-button {
   flex: 0 0 auto;
   border-color: #475569;
   color: #bfdbfe;
   background: #0f172a;
 }
 
-.print-all-button {
-  display: inline-flex;
-  width: auto;
-  min-width: 48px;
-  gap: 5px;
-  padding: 0 8px;
-}
-
-.print-all-button span {
-  font-size: 0.68rem;
-  font-weight: 700;
-  line-height: 1;
-}
-
-.catalog-print-button:hover:not(:disabled) {
+.catalog-download-button:hover:not(:disabled) {
   border-color: #3b82f6;
   color: #eff6ff;
   background: #1e3a8a;
@@ -1881,6 +1895,11 @@ button:disabled {
     margin-left: 0;
     grid-template-columns: 1fr;
     grid-template-rows: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace.one-pane,
+  .workspace.no-document-panes {
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .app-shell.review-pinned .workspace {
