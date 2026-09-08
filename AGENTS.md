@@ -1,69 +1,86 @@
-# COMPAREX — Agent Guide
+# COMPAREX - Agent Guide
 
 ## Product mission
 
-COMPAREX is a professional web application for reviewing two document versions side by side. It helps users find meaningful changes faster while keeping the human reviewer in control of every conclusion.
+COMPAREX is a professional document review workspace for opening, viewing, comparing, and annotating multiple PDF files. Users can add documents to a workspace, open them in either review pane, highlight text or page areas, and create explicit links between highlights or structured table rows.
 
-The product must communicate clarity, accuracy, efficiency, control, and trust. It is a review tool—not an autonomous decision-maker.
+COMPAREX organizes review evidence and relationships. It must communicate clarity, accuracy, efficiency, control, and trust, and it must not make legal, technical, compliance, or factual judgments on the user's behalf.
 
 ## Product principles
 
-1. **Show evidence, not conclusions.** Display the source text, location, and change type behind every result.
-2. **Preserve document context.** A difference without its page, section, and surrounding content is incomplete.
-3. **Keep the reviewer in control.** Never imply that an automated comparison is a legal, technical, or compliance judgment.
-4. **Prefer clarity over feature density.** Important changes should be obvious without making the interface visually noisy.
-5. **Fail honestly.** Unsupported, unreadable, password-protected, scanned, or partially parsed files must be identified clearly.
-6. **Treat documents as sensitive data.** Minimize retention, logging, exposure, and unnecessary transmission.
+1. **Keep documents flexible.** Files do not have fixed roles such as Original, Revised, TOR, or Evidence.
+2. **Show source context.** Every highlight and link must remain traceable to its document, page, and location.
+3. **Make relationships explicit.** Links are created or confirmed by the reviewer and must be visible, navigable, and removable.
+4. **Keep the reviewer in control.** Never infer approval, compliance, correctness, or equivalence from a highlight or link.
+5. **Prefer clarity over feature density.** Important review items should be obvious without making the interface visually noisy.
+6. **Preserve workspace state.** Keep open files, pane assignments, highlights, links, table rows, zoom, and navigation state when practical.
+7. **Fail honestly.** Unsupported, unreadable, password-protected, scanned, or partially rendered files must be identified clearly.
+8. **Treat documents as sensitive data.** Minimize retention, logging, exposure, and unnecessary transmission.
 
 ## MVP scope
 
-Build the smallest reliable workflow first:
+Build a flexible PDF review workspace:
 
-- Upload or select two documents: Version A and Version B.
-- Support PDF and DOCX input.
-- Render both documents in a synchronized split view.
-- Provide independent and linked scrolling.
-- Show filename, file type, page count, and processing status.
-- Allow zoom, page navigation, swapping sides, and replacing either file.
-- Preserve readable layout across desktop screen sizes.
-- Report parsing and rendering failures in plain language.
+- Add one or more PDF files through file selection or drag and drop.
+- Show all workspace files in a document list similar to an editor workspace.
+- Open and switch documents independently in either review pane.
+- Display two PDF documents side by side with an adjustable divider.
+- Allow the same document or different documents to be opened in each pane.
+- Show filename, file type, page count, and rendering status.
+- Provide zoom and page navigation for each pane.
+- Highlight selected text or rectangular page areas.
+- Create links between a PDF highlight and another PDF highlight.
+- Create links between a PDF highlight and a row in a workspace table.
+- Show linked and unlinked states without implying pass or fail.
+- Navigate from a table row or highlight to its linked source location.
+- Rename, reorder, open, close, replace, and remove workspace files.
+- Export annotated PDF files when the source PDF can be processed safely.
+- Preserve workspace metadata and review state locally when practical.
+- Preserve readable layout across desktop screen sizes and usable tablet widths.
+- Report unsupported, malformed, encrypted, or unreadable PDFs clearly.
 
-Do not claim semantic change detection until it is implemented and verified. Features such as added/deleted/modified text, change navigation, OCR, tables, annotations, and export belong to later milestones unless the current task explicitly includes them.
+DOCX rendering is outside the current scope. DOCX files must not be presented as supported until rendering and review behavior are implemented and verified.
 
-## Comparison model
+Automatic semantic comparison, OCR, automatic requirement extraction, and automatic compliance decisions are outside the MVP. Do not claim these capabilities until they are implemented and verified.
+
+## Workspace model
 
 Use neutral terminology consistently:
 
-- **Version A / Original**: the baseline document.
-- **Version B / Revised**: the document being compared.
-- **Added**: content present only in Version B.
-- **Deleted**: content present only in Version A.
-- **Modified**: aligned content whose value changed.
-- **Moved**: substantially matching content found in another location. Do not label content as moved unless confidence is sufficient.
-- **Unresolved**: content the system cannot align reliably.
+- **Workspace document**: any PDF file added to the current workspace.
+- **Review pane**: a document viewer that can open any workspace document.
+- **Highlight**: a reviewer-created text selection or rectangular page-area mark.
+- **Table row**: a structured review item created or imported by the user.
+- **Link**: an explicit relationship between two review items.
+- **Linked**: an item with at least one valid relationship.
+- **Unlinked**: an item without a relationship.
+- **Unresolved**: a relationship whose source document or source location is unavailable.
 
-Every detected change should eventually expose:
+Do not assign fixed semantic roles to the left and right panes. Labels such as TOR, requirement, evidence, original, or revised may be user-defined workspace content, but they must not be assumptions in the core document model.
 
-- change type;
-- page and section location on both sides, where available;
-- original and revised content;
-- surrounding context;
-- comparison confidence or an uncertainty state when applicable.
+Every highlight should retain:
 
-Never hide uncertainty behind a binary pass/fail result.
+- source document identity;
+- page number;
+- selected text or page-area coordinates where available;
+- optional reviewer note;
+- links to other highlights or table rows.
+
+Every link must be navigable and removable by the reviewer. Never hide uncertainty or missing source information behind a binary pass/fail result.
 
 ## UX requirements
 
 - Desktop-first for the primary review workspace; remain usable on tablets.
-- Use a stable two-column split view with an adjustable divider.
+- Use a stable two-column split view with an adjustable divider and independent document selection in each pane.
+- Keep the workspace file list easy to scan and make opening a file feel similar to an editor workspace.
 - Keep document controls close to the pane they affect.
 - Use color and a second signal such as labels, underlines, patterns, or icons. Color alone is insufficient.
 - Maintain keyboard navigation and visible focus states.
 - Meet WCAG 2.2 AA contrast targets.
 - Avoid modal dialogs for routine navigation.
-- Preserve the user’s page, zoom, scroll, and filter state whenever practical.
+- Preserve the user's open documents, pane assignments, page, zoom, scroll, table, and filter state whenever practical.
 - Confirm destructive actions such as removing an uploaded file or clearing a session.
-- Loading states must explain the current stage: uploading, extracting, rendering, aligning, or comparing.
+- Loading states must explain the current stage, such as opening, validating, or rendering.
 - Empty and error states must tell the user what happened and what they can do next.
 
 ## Brand and visual system
@@ -87,7 +104,7 @@ Typography:
 Visual rules:
 
 - Favor neutral surfaces, restrained borders, deliberate spacing, and crisp typography.
-- Use Teal and Blue to distinguish document versions; do not let either imply correct/incorrect.
+- Use Teal and Blue to distinguish panes, highlights, or link types; do not let either imply correct/incorrect.
 - Reserve Amber for items needing review—not generic decoration.
 - Avoid gradients, glow, glass effects, AI sparkles, playful illustrations, cybersecurity styling, and decorative animation.
 - Motion must clarify state changes and respect `prefers-reduced-motion`.
@@ -96,29 +113,38 @@ Visual rules:
 ## Content design
 
 - Use concise, factual language.
-- Never say “No differences” when only part of a document was processed. Say exactly what was checked.
+- Never say "No differences," "Matched," or similar when the system only knows that items were linked. Say exactly what the reviewer marked or what the system processed.
 - Avoid implying legal approval, compliance certification, or factual correctness.
-- Prefer “Review complete” over “Approved”.
-- Prefer “Potential change” when confidence is limited.
+- Prefer "Review complete" over "Approved."
+- Prefer "Unresolved" when a source file or location is unavailable.
 - File-processing errors should identify the affected file and preserve the other file when possible.
 - Design English and Thai copy together; do not assume English string length.
 
 ## Architecture expectations
 
-- Keep document ingestion, extraction, normalization, alignment, diffing, rendering, and presentation as separable modules.
+- Keep workspace state, document ingestion, rendering, highlighting, linking, table data, and export as separable modules.
 - Use explicit typed contracts between stages.
 - Keep original file bytes immutable.
 - Derive previews and extracted representations as versioned artifacts.
-- Ensure results can be traced back to source page coordinates.
-- Run expensive parsing and comparison work outside the interactive rendering loop.
+- Ensure highlights and links can be traced back to source page coordinates.
+- Run expensive parsing, rendering, and export work outside the interactive rendering loop.
 - Use cancellable jobs and idempotent processing where practical.
-- Do not bind the product to PDF-only concepts; use a document adapter interface.
-- Prefer deterministic comparison logic. If probabilistic or model-based processing is introduced, isolate it and expose uncertainty.
+- Keep document adapters explicit even while the current product supports PDF only.
+- Model links as a graph that supports highlight-to-highlight and highlight-to-row relationships.
+- Prefer deterministic review behavior. If probabilistic or model-based processing is introduced, isolate it and expose uncertainty.
 
 Suggested domain boundary:
 
 ```text
-DocumentAdapter -> ExtractedDocument -> Normalizer -> Aligner -> ChangeSet -> ReviewUI
+Workspace
+  -> DocumentRegistry
+  -> DocumentAdapter
+  -> PDFRenderer
+  -> HighlightStore
+  -> LinkGraph
+  -> TableModel
+  -> ReviewUI
+  -> Exporter
 ```
 
 ## Privacy and security
@@ -152,17 +178,19 @@ Changes are not complete until relevant checks pass.
 
 At minimum, cover:
 
-- same document compared with itself;
-- one-character, word, paragraph, and page-level changes;
-- insertions and deletions at the beginning and end;
-- repeated paragraphs and ambiguous alignment;
-- reordered sections;
-- tables, lists, headers, footers, and page numbers;
-- mixed Thai and English text;
+- adding multiple PDFs and switching the document in each pane;
+- opening the same PDF or different PDFs in both panes;
+- text highlights and rectangular area highlights;
+- links between highlights in different files;
+- links between highlights and table rows;
+- navigation from links to their source page and location;
+- removing a highlight and handling its related links correctly;
+- removing, replacing, renaming, and reordering workspace files;
+- restoring workspace state when one or more files no longer have permission;
+- annotations containing mixed Thai and English text;
 - Unicode normalization, ligatures, and unusual whitespace;
-- scanned/image-only PDFs;
-- malformed, encrypted, oversized, and unsupported files;
-- DOCX files with tracked changes, comments, images, and page breaks;
+- scanned/image-only, malformed, encrypted, oversized, and unsupported PDFs;
+- annotated PDF export and partial export failures;
 - keyboard-only use and screen-reader labels;
 - light mode, dark mode, high zoom, and narrow layouts.
 
@@ -173,7 +201,7 @@ Use synthetic or approved fixtures. Never add customer documents to the reposito
 - Keep the initial interface responsive while documents process.
 - Render only visible or nearby pages for long documents.
 - Avoid loading an entire large document into the browser when streaming or pagination is possible.
-- Debounce synchronized scrolling and prevent feedback loops between panes.
+- Keep independent pane scrolling responsive and prevent navigation feedback loops.
 - Measure before optimizing, but treat memory growth and UI blocking as defects.
 - Show progress for operations that are not effectively instant.
 
@@ -221,8 +249,8 @@ A change is complete when it:
 - Do not present COMPAREX as a legal, compliance, engineering, or editorial authority.
 - Do not use “AI-powered” as decoration or imply AI makes the final decision.
 - Do not prioritize flashy visual effects over document readability.
-- Do not use red/green alone to communicate changes.
+- Do not use red/green alone to communicate highlight or link states.
 - Do not silently omit unsupported pages, objects, or extraction failures.
-- Do not fabricate page matches, text coordinates, confidence, or successful processing.
+- Do not fabricate links, page locations, text coordinates, confidence, or successful processing.
 - Do not retain uploaded documents indefinitely by default.
-- Do not expand scope into editing, signing, approving, or document management unless explicitly requested.
+- Do not expand scope into editing document content, signing, approving, cloud synchronization, or general-purpose document management unless explicitly requested.
