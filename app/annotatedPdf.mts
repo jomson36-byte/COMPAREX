@@ -1,8 +1,16 @@
-import type { PDFDocument, PDFFont, PDFPage } from "pdf-lib";
+import type { PDFDocument, PDFFont, PDFImage, PDFPage } from "pdf-lib";
 import type { EvidenceMark } from "./PdfPreview";
+import {
+  annotationLabelFont,
+  annotationLabelFontStyle,
+  getAnnotationLabelLayout,
+} from "./annotationLabel.mts";
 
 type Anchor = NonNullable<EvidenceMark["annotation"]>;
 type PdfLibModule = typeof import("pdf-lib");
+type PreparedLabel =
+  | { kind: "font"; textWidth: number; fontSize: number }
+  | { kind: "image"; textWidth: number; fontSize: number; image: PDFImage };
 
 export type PdfAnnotation = {
   mark: EvidenceMark;
@@ -10,10 +18,62 @@ export type PdfAnnotation = {
   anchor: Anchor;
 };
 
-function drawAnnotation(
+async function prepareLabel(
+  pdf: PDFDocument,
+  font: PDFFont,
+  label: string,
+  pageWidth: number,
+  cache: Map<string, PreparedLabel>,
+): Promise<PreparedLabel> {
+  const fontSize = annotationLabelFont(pageWidth);
+  const cacheKey = `${label}:${fontSize}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Could not render the annotation label.");
+  context.font = annotationLabelFontStyle(fontSize);
+  const textWidth = context.measureText(label).width;
+
+  try {
+    font.widthOfTextAtSize(label, fontSize);
+    const prepared: PreparedLabel = {
+      kind: "font",
+      textWidth,
+      fontSize,
+    };
+    cache.set(cacheKey, prepared);
+    return prepared;
+  } catch {
+    // Standard PDF fonts cannot encode Thai digits. Render only that label as an image.
+    const textHeight = fontSize * 1.25;
+    const scale = 4;
+    canvas.width = Math.ceil(textWidth * scale);
+    canvas.height = Math.ceil(textHeight * scale);
+    context.scale(scale, scale);
+    context.font = annotationLabelFontStyle(fontSize);
+    context.textBaseline = "alphabetic";
+    context.fillStyle = "#eff6ff";
+    context.fillText(label, 0, textHeight - fontSize * 0.16);
+
+    const prepared: PreparedLabel = {
+      kind: "image",
+      textWidth,
+      fontSize,
+      image: await pdf.embedPng(canvas.toDataURL("image/png")),
+    };
+    cache.set(cacheKey, prepared);
+    return prepared;
+  }
+}
+
+async function drawAnnotation(
   pdfLib: PdfLibModule,
+  pdf: PDFDocument,
   page: PDFPage,
   font: PDFFont,
+  labelCache: Map<string, PreparedLabel>,
   annotation: PdfAnnotation,
 ) {
   const { rgb } = pdfLib;
@@ -53,56 +113,42 @@ function drawAnnotation(
   if (!requirementNo) return;
 
   const labelAnchor = mark.area ? anchor : anchor.rects?.[0] ?? anchor;
-  const fontSize = 9;
   const label = `#${requirementNo}`;
-  const paddingX = 4;
-  const paddingY = 3;
-  const labelWidth = font.widthOfTextAtSize(label, fontSize) + paddingX * 2;
-  const labelHeight = fontSize + paddingY * 2;
-  const homeX = Math.min(
-    Math.max(cropX + labelAnchor.x * width, cropX),
-    cropX + width - labelWidth,
-  );
-  const homeTop = Math.min(
-    Math.max(labelAnchor.y * height - labelHeight, 0),
-    height - labelHeight,
-  );
-  const x = mark.labelPosition
-    ? Math.min(
-        Math.max(cropX + mark.labelPosition.x * width, cropX),
-        cropX + width - labelWidth,
-      )
-    : Math.min(
-        Math.max(homeX + (mark.labelOffset?.x ?? 0) * width, cropX),
-        cropX + width - labelWidth,
-      );
-  const y = mark.labelPosition
-    ? Math.min(
-        Math.max(cropY + height - mark.labelPosition.y * height - labelHeight, cropY),
-        cropY + height - labelHeight,
-      )
-    : cropY +
-      height -
-      Math.min(
-        Math.max(homeTop + (mark.labelOffset?.y ?? 0) * height, 0),
-        height - labelHeight,
-      ) -
-      labelHeight;
+  const preparedLabel = await prepareLabel(pdf, font, label, width, labelCache);
+  const layout = getAnnotationLabelLayout({
+    pageWidth: width,
+    pageHeight: height,
+    textWidth: preparedLabel.textWidth,
+    anchor: labelAnchor,
+    position: mark.labelPosition,
+    offset: mark.labelOffset,
+  });
+  const x = cropX + layout.x;
+  const y = cropY + height - layout.y - layout.height;
 
   page.drawRectangle({
     x,
     y,
-    width: labelWidth,
-    height: labelHeight,
-    color: rgb(0.11, 0.31, 0.85),
+    width: layout.width,
+    height: layout.height,
+    color: rgb(29 / 255, 78 / 255, 216 / 255),
   });
-  page.drawText(label, {
-    x: x + paddingX,
-    y: y + paddingY,
-    size: fontSize,
-    font,
-    color: rgb(1, 1, 1),
-  });
+  if (preparedLabel.kind === "image") {
+    page.drawImage(preparedLabel.image, {
+      x: x + layout.paddingX,
+      y: y + layout.paddingY,
+      width: preparedLabel.textWidth,
+      height: layout.fontSize * 1.25,
+    });
+  } else {
+    page.drawText(label, {
+      x: x + layout.paddingX,
+      y: y + layout.paddingY + layout.fontSize * 0.16,
+      size: layout.fontSize,
+      font,
+      color: rgb(239 / 255, 246 / 255, 1),
+    });
+  }
 }
 
 async function createDirectAnnotatedPdf(
@@ -118,13 +164,14 @@ async function createDirectAnnotatedPdf(
   });
   const pageCount = pdf.getPageCount();
   const font = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const labelCache = new Map<string, PreparedLabel>();
   if (title) pdf.setTitle(title);
 
-  annotations.forEach((annotation) => {
+  for (const annotation of annotations) {
     const { mark } = annotation;
-    if (mark.page < 1 || mark.page > pageCount) return;
-    drawAnnotation(pdfLib, pdf.getPage(mark.page - 1), font, annotation);
-  });
+    if (mark.page < 1 || mark.page > pageCount) continue;
+    await drawAnnotation(pdfLib, pdf, pdf.getPage(mark.page - 1), font, labelCache, annotation);
+  }
 
   return new Blob([Uint8Array.from(await pdf.save()).buffer], {
     type: "application/pdf",
@@ -145,6 +192,7 @@ async function createRasterizedAnnotatedPdf(
   const sourcePdf = await loadingTask.promise;
   const outputPdf = await PDFDocument.create();
   const font = await outputPdf.embedFont(StandardFonts.HelveticaBold);
+  const labelCache = new Map<string, PreparedLabel>();
   if (title) outputPdf.setTitle(title);
   const annotationsByPage = new Map<number, PdfAnnotation[]>();
 
@@ -194,9 +242,9 @@ async function createRasterizedAnnotatedPdf(
         height: baseViewport.height,
       });
 
-      (annotationsByPage.get(pageNumber) ?? []).forEach((annotation) => {
-        drawAnnotation(pdfLib, outputPage, font, annotation);
-      });
+      for (const annotation of annotationsByPage.get(pageNumber) ?? []) {
+        await drawAnnotation(pdfLib, outputPdf, outputPage, font, labelCache, annotation);
+      }
     }
   } finally {
     await loadingTask.destroy();

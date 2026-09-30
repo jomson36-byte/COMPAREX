@@ -30,10 +30,17 @@ import {
   X,
 } from "lucide-react";
 import comparexLogo from "./assets/png/comparex-horizontal-light-2x.png";
-import { createAnnotatedPdf } from "./annotatedPdf";
-import type { PdfAnnotation } from "./annotatedPdf";
+import { createAnnotatedPdf } from "./annotatedPdf.mts";
+import type { PdfAnnotation } from "./annotatedPdf.mts";
 import type { EvidenceMark } from "./PdfPreview";
 import type { RequirementGridRow } from "./RequirementGrid";
+import {
+  appendRequirementPath,
+  getParentRequirementNumber,
+  getRootRequirementPath,
+  normalizeRequirementStartPath,
+  toAsciiDigits,
+} from "./requirementNumbering.mts";
 
 const PdfPreview = dynamic(() => import("./PdfPreview"), {
   ssr: false,
@@ -146,17 +153,6 @@ function formatFileSize(bytes: number) {
   return `${(kilobytes / 1024).toFixed(1)} MB`;
 }
 
-function normalizeRequirementStartPath(value: unknown) {
-  const text = String(value ?? "1").trim();
-  return /^\d+(?:\.\d+)*$/.test(text) ? text : "1";
-}
-
-function getRootRequirementPath(startPath: string, index: number) {
-  const parts = normalizeRequirementStartPath(startPath).split(".");
-  const last = Number(parts.at(-1) ?? 1) + index;
-  return [...parts.slice(0, -1), String(last)].join(".");
-}
-
 function sanitizeMarksForStorage(marks: EvidenceMark[]) {
   return marks.map(({ fileUrl: _fileUrl, ...mark }) => mark);
 }
@@ -202,8 +198,9 @@ function writePersistedWorkspace(state: PersistedWorkspaceState) {
 function clearPersistedWorkspace() {
   try {
     window.localStorage.removeItem(workspaceStorageKey);
+    return true;
   } catch {
-    // Clearing storage should never block the active review session.
+    return false;
   }
 }
 
@@ -270,11 +267,25 @@ async function deleteFileHandle(key: string) {
 }
 
 async function clearFileHandles() {
-  if (!("indexedDB" in window)) return;
+  if (!("indexedDB" in window)) return true;
   try {
-    await withFileHandleStore("readwrite", (store) => store.clear());
+    const database = await openFileHandleDatabase();
+    return await new Promise<boolean>((resolve) => {
+      const transaction = database.transaction(fileHandleStoreName, "readwrite");
+      transaction.objectStore(fileHandleStoreName).clear();
+      transaction.oncomplete = () => {
+        database.close();
+        resolve(true);
+      };
+      const fail = () => {
+        database.close();
+        resolve(false);
+      };
+      transaction.onerror = fail;
+      transaction.onabort = fail;
+    });
   } catch {
-    // Ignore stale handles.
+    return false;
   }
 }
 
@@ -619,6 +630,8 @@ export default function Home() {
   const [catalogFiles, setCatalogFiles] = useState<UploadedFile[]>([]);
   const [isCatalogMenuOpen, setIsCatalogMenuOpen] = useState(false);
   const [isDownloadingEvidence, setIsDownloadingEvidence] = useState(false);
+  const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
+  const [isClearingProject, setIsClearingProject] = useState(false);
   const [marks, setMarks] = useState<EvidenceMark[]>([]);
   const [catalogLabelOffset, setCatalogLabelOffset] = useState<{
     x: number;
@@ -650,6 +663,8 @@ export default function Home() {
     catalogs: UploadedFile[];
   }>({ tor: null, catalogs: [] });
   const workspaceRef = useRef<HTMLElement>(null);
+  const clearDialogRef = useRef<HTMLDialogElement>(null);
+  const skipNextPersistRef = useRef(false);
   const catalogMenuRef = useRef<HTMLDetailsElement>(null);
   const catalogPickerRef = useRef<HTMLInputElement>(null);
 
@@ -835,6 +850,10 @@ export default function Home() {
 
   useEffect(() => {
     if (!hasRestoredWorkspace) return;
+    if (skipNextPersistRef.current) {
+      skipNextPersistRef.current = false;
+      return;
+    }
 
     writePersistedWorkspace({
       version: 1,
@@ -887,6 +906,13 @@ export default function Home() {
     storedFileHint,
     workspaceName,
   ]);
+
+  useEffect(() => {
+    const dialog = clearDialogRef.current;
+    if (!dialog) return;
+    if (isClearConfirmOpen && !dialog.open) dialog.showModal();
+    if (!isClearConfirmOpen && dialog.open) dialog.close();
+  }, [isClearConfirmOpen]);
 
   useEffect(() => {
     sessionFilesRef.current = { tor: files.left, catalogs: catalogFiles };
@@ -1175,13 +1201,13 @@ export default function Home() {
     const idsByNumber = new Map<string, string>();
     const additions = items.map((item) => {
       const id = crypto.randomUUID();
-      idsByNumber.set(item.number, id);
+      idsByNumber.set(toAsciiDigits(item.number), id);
       return { ...item, id };
     });
     setMarks((current) => [
       ...current,
       ...additions.map((item) => {
-        const parentNumber = item.number.split(".").slice(0, -1).join(".");
+        const parentNumber = getParentRequirementNumber(item.number);
         return {
           id: item.id,
           side: "tor" as const,
@@ -1458,7 +1484,7 @@ export default function Home() {
   ): Array<{ mark: EvidenceMark; path: string; depth: number }> =>
     items.flatMap((mark, index) => {
       const path = prefix
-        ? `${prefix}.${index + 1}`
+        ? appendRequirementPath(prefix, index + 1)
         : getRootRequirementPath(requirementStartPath, index);
       const children = torMarks.filter((item) => item.parentId === mark.id);
       return [
@@ -1724,6 +1750,52 @@ export default function Home() {
     } finally {
       setIsDownloadingEvidence(false);
     }
+  };
+
+  const clearProject = async () => {
+    setIsClearConfirmOpen(false);
+    setIsClearingProject(true);
+    const handlesCleared = await clearFileHandles();
+    const workspaceCleared = handlesCleared && clearPersistedWorkspace();
+    if (!workspaceCleared) {
+      setIsClearingProject(false);
+      setRestoreMessage("Could not clear the saved project. Check browser storage access and try again.");
+      return;
+    }
+
+    skipNextPersistRef.current = true;
+    const urls = new Set([
+      files.left?.url,
+      files.right?.url,
+      ...catalogFiles.map((item) => item.url),
+    ]);
+    urls.forEach((url) => {
+      if (url) URL.revokeObjectURL(url);
+    });
+    sessionFilesRef.current = { tor: null, catalogs: [] };
+    setFiles({ left: null, right: null });
+    setCatalogFiles([]);
+    setMarks([]);
+    setWorkspaceName("Untitled workspace");
+    setLeftWidth(50);
+    setRequirementStartPath("1");
+    setIsResizing(false);
+    setIsCatalogMenuOpen(false);
+    setCatalogLabelOffset(null);
+    setPendingLinkId(null);
+    setIsReviewOpen(false);
+    setIsReviewPinned(false);
+    setShowTorPane(true);
+    setShowEvidencePane(true);
+    setReviewFilter("all");
+    setDragOverTorId(null);
+    setPendingJumpId(null);
+    setInteractionMode("highlight");
+    setCollapsedRequirements(new Set());
+    setRequirementComposer(null);
+    setStoredFileHint(null);
+    setRestoreMessage("Project cleared. Original files remain on your device.");
+    setIsClearingProject(false);
   };
 
   const resizePanels = (event: PointerEvent<HTMLDivElement>) => {
@@ -2077,6 +2149,18 @@ export default function Home() {
             <Download aria-hidden="true" size={17} />
             <span>{isDownloadingEvidence ? "Downloading..." : "Download all"}</span>
           </button>
+          <span className="toolbar-separator" aria-hidden="true" />
+          <button
+            className="tool-button danger-tool"
+            type="button"
+            onClick={() => setIsClearConfirmOpen(true)}
+            disabled={!hasRestoredWorkspace || isRestoringFiles || isDownloadingEvidence || isClearingProject}
+            aria-label="Clear Project"
+            title="Clear Project"
+          >
+            <Trash2 aria-hidden="true" size={17} />
+            <span>{isClearingProject ? "Clearing..." : "Clear Project"}</span>
+          </button>
         </nav>
 
         <div
@@ -2099,6 +2183,30 @@ export default function Home() {
           </button>
         </div>
       ) : null}
+
+      <dialog
+        ref={clearDialogRef}
+        className="clear-project-dialog"
+        aria-labelledby="clear-project-title"
+        aria-describedby="clear-project-description"
+        onCancel={() => setIsClearConfirmOpen(false)}
+        onClose={() => setIsClearConfirmOpen(false)}
+      >
+        <h2 id="clear-project-title">Clear Project?</h2>
+        <p id="clear-project-description">
+          This removes the current project’s documents, requirements, highlights,
+          links, and saved review state from this browser. Original files on your
+          device stay where they are. This cannot be undone.
+        </p>
+        <div className="clear-project-actions">
+          <button type="button" autoFocus onClick={() => setIsClearConfirmOpen(false)}>
+            Cancel
+          </button>
+          <button type="button" className="clear-project-confirm" onClick={() => void clearProject()}>
+            Clear Project
+          </button>
+        </div>
+      </dialog>
 
       <section
         ref={workspaceRef}
@@ -2434,7 +2542,7 @@ export default function Home() {
               <input
                 type="text"
                 inputMode="decimal"
-                pattern="\\d+(\\.\\d+)*"
+                pattern="[0-9๐-๙]+(\\.[0-9๐-๙]+)*"
                 value={requirementStartPath}
                 onChange={(event) => {
                   setRequirementStartPath(event.target.value);

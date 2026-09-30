@@ -224,6 +224,23 @@ button:disabled {
   white-space: nowrap;
 }
 
+@media (max-width: 1380px) {
+  .privacy-status span {
+    display: none;
+  }
+}
+
+@media (max-width: 1180px) {
+  .tool-button {
+    width: 34px;
+    padding: 0;
+  }
+
+  .tool-button span {
+    display: none;
+  }
+}
+
 .restore-file-status {
   position: fixed;
   top: 64px;
@@ -241,6 +258,54 @@ button:disabled {
   box-shadow: 0 14px 32px rgb(2 6 23 / 45%);
   font-size: 0.78rem;
   line-height: 1.35;
+}
+
+.clear-project-dialog {
+  width: min(440px, calc(100vw - 32px));
+  border: 1px solid #475569;
+  border-radius: 12px;
+  padding: 24px;
+  color: #f8fafc;
+  background: #111827;
+  box-shadow: 0 24px 64px rgb(2 6 23 / 60%);
+}
+
+.clear-project-dialog::backdrop {
+  background: rgb(2 6 23 / 72%);
+}
+
+.clear-project-dialog h2 {
+  margin: 0 0 12px;
+  font-size: 1.2rem;
+}
+
+.clear-project-dialog p {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.clear-project-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.clear-project-actions button:focus-visible {
+  outline: 2px solid #14b8a6;
+  outline-offset: 2px;
+}
+
+.clear-project-confirm {
+  border-color: #b91c1c;
+  background: #991b1b;
+}
+
+.clear-project-confirm:hover:not(:disabled) {
+  border-color: #ef4444;
+  background: #b91c1c;
 }
 
 .restore-file-status button {

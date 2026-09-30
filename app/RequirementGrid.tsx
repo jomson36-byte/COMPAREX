@@ -14,6 +14,7 @@ import {
 import "@glideapps/glide-data-grid/dist/index.css";
 import { IndentDecrease, IndentIncrease } from "lucide-react";
 import type { EvidenceMark } from "./PdfPreview";
+import { parseNumberedRequirements } from "./requirementNumbering.mts";
 
 export type RequirementGridRow =
   | {
@@ -114,64 +115,6 @@ const sourceCell = (mark: EvidenceMark | undefined, fallback: string): GridCell 
       window.open(mark.fileUrl, "_blank", "noopener,noreferrer");
     },
   };
-};
-
-const parseNumberedRequirements = (value: string) => {
-  const parsed: Array<{ number: string; title: string }> = [];
-  const levels: Array<{ indent: number; number: number }> = [];
-
-  value.split(/\r?\n/).forEach((rawLine) => {
-    const normalizedLine = rawLine
-      .replace(/\u00a0/g, " ")
-      .replace(/\t/g, "  ");
-    const line = normalizedLine.replace(/\*\*|__/g, "").trim();
-    if (!line) return;
-    const match = normalizedLine
-      .replace(/\*\*|__/g, "")
-      .match(/^(\s*)(\d+(?:\.\d+)*)(?:[.)])?\s+(.+)$/);
-
-    if (match) {
-      const indent = match[1].length;
-      const rawNumber = match[2];
-      const title = match[3].trim();
-      const number = rawNumber.includes(".")
-        ? rawNumber
-        : (() => {
-            const sameLevelIndex = levels.findIndex(
-              (level) => level.indent === indent,
-            );
-            if (sameLevelIndex >= 0) {
-              levels.splice(sameLevelIndex + 1);
-              levels[sameLevelIndex] = { indent, number: Number(rawNumber) };
-              return levels.map((level) => level.number).join(".");
-            }
-
-            const parentIndex = [...levels]
-              .map((level, index) => ({ level, index }))
-              .reverse()
-              .find(({ level }) => level.indent < indent)?.index;
-
-            if (parentIndex === undefined) {
-              levels.splice(0, levels.length, {
-                indent,
-                number: Number(rawNumber),
-              });
-              return rawNumber;
-            }
-
-            levels.splice(parentIndex + 1);
-            levels.push({ indent, number: Number(rawNumber) });
-            return levels.map((level) => level.number).join(".");
-          })();
-
-      parsed.push({ number, title });
-      return;
-    }
-
-    const previous = parsed.at(-1);
-    if (previous) previous.title = `${previous.title} ${line}`.trim();
-  });
-  return parsed;
 };
 
 export default function RequirementGrid({

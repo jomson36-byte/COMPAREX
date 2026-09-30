@@ -2,6 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  annotationLabelFont,
+  annotationLabelFontStyle,
+  getAnnotationLabelLayout,
+} from "./annotationLabel.mts";
+import {
   create,
   PDFSlick,
 } from "@pdfslick/core";
@@ -165,24 +170,26 @@ export default function PdfPreview({
         const anchor = mark.annotation ?? (mark.area ? { x: mark.area.x, y: mark.area.y } : undefined);
         if (!requirementNo || !anchor) return;
         const labelAnchor = mark.area ? anchor : anchor.rects?.[0] ?? anchor;
-        const fontSize = Math.max(10, width * 0.015);
-        context.font = `700 ${fontSize}px Arial, Helvetica, sans-serif`;
+        const fontSize = annotationLabelFont(width);
+        context.font = annotationLabelFontStyle(fontSize);
         const label = `#${requirementNo}`;
-        const paddingX = fontSize * 0.45;
-        const paddingY = fontSize * 0.28;
-        const labelWidth = context.measureText(label).width + paddingX * 2;
-        const labelHeight = fontSize * 1.25 + paddingY * 2;
-        const homeX = Math.min(Math.max(labelAnchor.x * width, 0), width - labelWidth);
-        const homeY = Math.max(labelAnchor.y * height - labelHeight, 0);
-        const offsetX = (mark.labelOffset?.x ?? 0) * width;
-        const offsetY = (mark.labelOffset?.y ?? 0) * height;
-        const x = Math.min(
-          Math.max(mark.labelPosition ? mark.labelPosition.x * width : homeX + offsetX, 0),
-          width - labelWidth,
-        );
-        const y = mark.labelPosition
-          ? Math.min(Math.max(mark.labelPosition.y * height, 0), height - labelHeight)
-          : Math.min(Math.max(homeY + offsetY, 0), height - labelHeight);
+        const {
+          x,
+          y,
+          width: labelWidth,
+          height: labelHeight,
+          paddingX,
+          paddingY,
+          homeX,
+          homeY,
+        } = getAnnotationLabelLayout({
+          pageWidth: width,
+          pageHeight: height,
+          textWidth: context.measureText(label).width,
+          anchor: labelAnchor,
+          position: mark.labelPosition,
+          offset: mark.labelOffset,
+        });
         context.fillStyle = "#1d4ed8";
         context.fillRect(x, y, labelWidth, labelHeight);
         context.fillStyle = "#eff6ff";
