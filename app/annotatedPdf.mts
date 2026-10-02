@@ -3,6 +3,7 @@ import type { EvidenceMark } from "./PdfPreview";
 import {
   annotationLabelFont,
   annotationLabelFontStyle,
+  getAnnotationLabelConnector,
   getAnnotationLabelLayout,
 } from "./annotationLabel.mts";
 
@@ -112,7 +113,7 @@ async function drawAnnotation(
 
   if (!requirementNo) return;
 
-  const labelAnchor = mark.area ? anchor : anchor.rects?.[0] ?? anchor;
+  const labelAnchor = mark.area ?? anchor.rects?.find((rect) => rect.width > 0 && rect.height > 0) ?? anchor;
   const label = `#${requirementNo}`;
   const preparedLabel = await prepareLabel(pdf, font, label, width, labelCache);
   const layout = getAnnotationLabelLayout({
@@ -125,6 +126,24 @@ async function drawAnnotation(
   });
   const x = cropX + layout.x;
   const y = cropY + height - layout.y - layout.height;
+
+  const connector = getAnnotationLabelConnector(
+    { x: layout.x, y: layout.y, width: layout.width, height: layout.height },
+    {
+      x: labelAnchor.x * width,
+      y: labelAnchor.y * height,
+      width: ("width" in labelAnchor ? labelAnchor.width : 0) * width,
+      height: ("height" in labelAnchor ? labelAnchor.height : 0) * height,
+    },
+  );
+  if (connector) {
+    page.drawLine({
+      start: { x: cropX + connector.start.x, y: cropY + height - connector.start.y },
+      end: { x: cropX + connector.end.x, y: cropY + height - connector.end.y },
+      thickness: Math.max(0.6, width * 0.0014),
+      color: rgb(29 / 255, 78 / 255, 216 / 255),
+    });
+  }
 
   page.drawRectangle({
     x,

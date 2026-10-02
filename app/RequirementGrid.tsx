@@ -12,9 +12,10 @@ import {
   type Item,
 } from "@glideapps/glide-data-grid";
 import "@glideapps/glide-data-grid/dist/index.css";
-import { IndentDecrease, IndentIncrease } from "lucide-react";
+import { IndentDecrease, IndentIncrease, X } from "lucide-react";
 import type { EvidenceMark } from "./PdfPreview";
 import { parseNumberedRequirements } from "./requirementNumbering.mts";
+import { evidenceCellSummary, evidenceTargetForCell } from "./workspaceTable.mts";
 
 export type RequirementGridRow =
   | {
@@ -36,7 +37,7 @@ type Props = {
   rows: RequirementGridRow[];
   showStartHint: boolean;
   onJump: (mark: EvidenceMark) => void;
-  onUnlink: (mark: EvidenceMark) => void;
+  onUnlink: (mark: EvidenceMark, requirement?: EvidenceMark) => void;
   onDropEvidence: (requirement: EvidenceMark, evidenceId: string) => void;
   onAddRequirement: (title: string) => void;
   onAddRequirements: (items: Array<{ number: string; title: string }>) => void;
@@ -45,8 +46,13 @@ type Props = {
   onChangeParent: (mark: EvidenceMark, parentId?: string) => void;
   isLinkMode: boolean;
   onSelectForLink: (mark: EvidenceMark) => void;
+  onEvidenceTargetChange: (mark: EvidenceMark | null) => void;
   onDeleteRequirements: (marks: EvidenceMark[]) => void;
   onRemoveUnassignedEvidence: (mark: EvidenceMark) => void;
+  focusMarkId?: string | null;
+  onFocusHandled?: () => void;
+  focusEvidenceMarkId?: string | null;
+  onEvidenceFocusHandled?: () => void;
 };
 
 const initialColumns: GridColumn[] = [
@@ -99,7 +105,7 @@ const textCell = (data: string, themeOverride?: GridCell["themeOverride"]): Grid
   themeOverride,
 });
 
-const sourceCell = (mark: EvidenceMark | undefined, fallback: string): GridCell => {
+const sourceCell = (mark: EvidenceMark | undefined, fallback: string, onJump: (mark: EvidenceMark) => void): GridCell => {
   if (!mark?.fileUrl) return textCell(fallback, { textDark: "#64748b" });
 
   return {
@@ -112,7 +118,7 @@ const sourceCell = (mark: EvidenceMark | undefined, fallback: string): GridCell 
     themeOverride: { linkColor: "#5eead4" },
     onClickUri: ({ preventDefault }) => {
       preventDefault();
-      window.open(mark.fileUrl, "_blank", "noopener,noreferrer");
+      onJump(mark);
     },
   };
 };
@@ -130,12 +136,18 @@ export default function RequirementGrid({
   onChangeParent,
   isLinkMode,
   onSelectForLink,
+  onEvidenceTargetChange,
   onDeleteRequirements,
   onRemoveUnassignedEvidence,
+  focusMarkId,
+  onFocusHandled,
+  focusEvidenceMarkId,
+  onEvidenceFocusHandled,
 }: Props) {
   const gridRef = useRef<DataEditorRef>(null);
   const focusTrailingRow = useRef(false);
   const [selectedRow, setSelectedRow] = useState<number | null>(null);
+  const [isEvidenceDetailOpen, setIsEvidenceDetailOpen] = useState(false);
   const [gridColumns, setGridColumns] = useState<GridColumn[]>(initialColumns);
   const [hasRestoredColumns, setHasRestoredColumns] = useState(false);
   const [gridSelection, setGridSelection] =
@@ -154,12 +166,14 @@ export default function RequirementGrid({
   const handleGridSelectionChange = useCallback(
     (selection: GridSelection) => {
       setGridSelection(selection);
-      if (!isLinkMode) return;
-      const rowIndex = selection.current?.cell[1];
-      const row = rowIndex === undefined ? undefined : rows[rowIndex];
-      if (row?.kind === "requirement") onSelectForLink(row.mark);
+      const selectedIndex = selection.current?.cell[1];
+      if (selectedIndex !== undefined && rows[selectedIndex]) setSelectedRow(selectedIndex);
+      if (selection.current) {
+        const target = isLinkMode ? null : evidenceTargetForCell(rows, selection.current.cell);
+        onEvidenceTargetChange(target?.mark ?? null);
+      }
     },
-    [isLinkMode, onSelectForLink, rows],
+    [isLinkMode, onEvidenceTargetChange, rows],
   );
 
   useEffect(() => {
@@ -175,6 +189,47 @@ export default function RequirementGrid({
     });
     requestAnimationFrame(() => gridRef.current?.focus());
   }, [rows.length]);
+
+  useEffect(() => {
+    if (!focusMarkId) return;
+    const rowIndex = rows.findIndex((row) => row.mark.id === focusMarkId);
+    if (rowIndex < 0) return;
+    setSelectedRow(rowIndex);
+    setIsEvidenceDetailOpen(false);
+    setGridSelection({
+      ...emptyGridSelection,
+      current: {
+        cell: [1, rowIndex],
+        range: { x: 1, y: rowIndex, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    });
+    requestAnimationFrame(() => {
+      gridRef.current?.scrollTo(1, rowIndex, "both", 12, 12, { vAlign: "center" });
+      gridRef.current?.focus();
+      onFocusHandled?.();
+    });
+  }, [focusMarkId, onFocusHandled, rows]);
+
+  useEffect(() => {
+    if (!focusEvidenceMarkId) return;
+    const rowIndex = rows.findIndex((row) => row.kind === "requirement" && row.mark.id === focusEvidenceMarkId);
+    if (rowIndex < 0) return;
+    setSelectedRow(rowIndex);
+    setIsEvidenceDetailOpen(false);
+    setGridSelection({
+      ...emptyGridSelection,
+      current: {
+        cell: [3, rowIndex],
+        range: { x: 3, y: rowIndex, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    });
+    requestAnimationFrame(() => {
+      gridRef.current?.scrollTo(3, rowIndex, "both", 12, 12, { vAlign: "center" });
+      onEvidenceFocusHandled?.();
+    });
+  }, [focusEvidenceMarkId, onEvidenceFocusHandled, rows]);
 
   const getCellContent = useCallback(
     ([column, rowIndex]: Item): GridCell => {
@@ -194,17 +249,12 @@ export default function RequirementGrid({
       const row = rows[rowIndex];
       if (!row) return textCell("");
       const isRequirement = row.kind === "requirement";
-      const sourceMark = isRequirement ? row.evidence[0] : row.mark;
-      const sourceFiles = isRequirement
-        ? [...new Set(row.evidence.map((item) => item.fileName))]
-        : [row.mark.fileName];
+      const sourceMark = isRequirement && row.mark.manual ? undefined : row.mark;
+      const sourceLabel = isRequirement && row.mark.manual
+        ? "Manual row"
+        : `${row.mark.fileName} · p.${row.mark.page}`;
       const evidenceSummary = isRequirement
-        ? (() => {
-            const pages = [...new Set(row.evidence.map((item) => item.page))]
-              .filter((page) => page > 0)
-              .sort((a, b) => a - b);
-            return pages.length ? `หน้า ${pages.join(", ")}` : "";
-          })()
+        ? evidenceCellSummary(row.evidence)
         : `หน้า ${row.mark.page}`;
 
       switch (column) {
@@ -239,19 +289,18 @@ export default function RequirementGrid({
         case 2:
           return sourceCell(
             sourceMark,
-            sourceFiles.length
-              ? `${sourceFiles[0]}${sourceFiles.length > 1 ? ` +${sourceFiles.length - 1}` : ""}`
-              : "No evidence",
+            sourceLabel,
+            onJump,
           );
         case 3:
-          return textCell(evidenceSummary || "Drop evidence here", {
+          return textCell(evidenceSummary || "Add evidence", {
             textDark: evidenceSummary ? "#bfdbfe" : "#64748b",
           });
         default:
           return textCell("");
       }
     },
-    [rows],
+    [onJump, rows],
   );
 
   const onCellClicked = useCallback(
@@ -259,6 +308,7 @@ export default function RequirementGrid({
       const row = rows[rowIndex];
       if (!row) return;
       setSelectedRow(rowIndex);
+      onEvidenceTargetChange(!isLinkMode && column === 3 && row.kind === "requirement" ? row.mark : null);
 
       if (isLinkMode && row.kind === "requirement") {
         onSelectForLink(row.mark);
@@ -270,12 +320,11 @@ export default function RequirementGrid({
         return;
       }
       if (column === 3) {
-        const target = row.kind === "requirement" ? row.evidence[0] : undefined;
-        if (target) onJump(target);
+        if (row.kind === "requirement") setIsEvidenceDetailOpen(true);
         return;
       }
     },
-    [isLinkMode, onJump, onRemoveUnassignedEvidence, onSelectForLink, rows],
+    [isLinkMode, onEvidenceTargetChange, onJump, onSelectForLink, rows],
   );
 
   const changeSelectedDepth = (isOutdent: boolean, fallbackIndex?: number) => {
@@ -336,6 +385,7 @@ export default function RequirementGrid({
           <IndentDecrease aria-hidden="true" size={15} />
         </button>
       </div>
+      <div className="requirement-grid-canvas">
       <DataEditor
         ref={gridRef}
         columns={gridColumns}
@@ -458,6 +508,32 @@ export default function RequirementGrid({
           if (row?.kind === "requirement") onRenameRequirement(row.mark, title);
         }}
         onKeyDown={(event) => {
+          if (event.key === "Escape" && isEvidenceDetailOpen) {
+            setIsEvidenceDetailOpen(false);
+            event.preventDefault();
+            event.cancel();
+            return;
+          }
+          if (event.key === "Enter" && event.location?.[0] === 3) {
+            const rowIndex = event.location[1];
+            if (rows[rowIndex]?.kind === "requirement" && !isLinkMode) {
+              setSelectedRow(rowIndex);
+              onEvidenceTargetChange(rows[rowIndex].mark);
+              setIsEvidenceDetailOpen(true);
+              event.preventDefault();
+              event.cancel();
+              return;
+            }
+          }
+          if (event.key === "Enter" && isLinkMode && event.location) {
+            const row = rows[event.location[1]];
+            if (row?.kind === "requirement") {
+              onSelectForLink(row.mark);
+              event.preventDefault();
+              event.cancel();
+              return;
+            }
+          }
           const isIndent = event.ctrlKey && event.key === "]";
           const isOutdent = event.ctrlKey && event.key === "[";
           if ((!isIndent && !isOutdent) || !event.location) return;
@@ -496,7 +572,7 @@ export default function RequirementGrid({
         smoothScrollX
         smoothScrollY
         width="100%"
-        height="max(320px, calc(100vh - 230px))"
+        height="100%"
         theme={{
           accentColor: "#14b8a6",
           accentFg: "#f8fafc",
@@ -514,30 +590,45 @@ export default function RequirementGrid({
           headerFontStyle: "600 11px",
         }}
       />
+      </div>
       {showStartHint ? (
         <p className="requirement-grid-empty-hint" role="status">
-          Highlight a TOR section or add a requirement to begin.
+          Add a row to begin reviewing documents.
         </p>
       ) : null}
-      {selected?.kind === "requirement" && selected.evidence.length ? (
-        <div className="grid-selection-detail">
-          <strong>{selected.path} · Linked evidence</strong>
-          {selected.evidence.map((evidence) => (
-            <div key={evidence.id}>
-              <button type="button" onClick={() => onJump(evidence)}>
-                <span>{evidence.text}</span>
-                <small>{evidence.fileName} · p.{evidence.page}</small>
-              </button>
-              <button
-                type="button"
-                onClick={() => onUnlink(evidence)}
-                aria-label={`Unlink evidence on page ${evidence.page}`}
-              >
-                Unlink
-              </button>
+      {isEvidenceDetailOpen && selected?.kind === "requirement" ? (
+        <section className="grid-selection-detail" aria-label={`Evidence for requirement ${selected.path}`}>
+          <div className="grid-selection-detail-header">
+            <strong>{selected.path} · {evidenceCellSummary(selected.evidence) || "No evidence"}</strong>
+            <button type="button" onClick={() => setIsEvidenceDetailOpen(false)} aria-label="Close evidence list">
+              <X aria-hidden="true" size={15} />
+            </button>
+          </div>
+          {selected.evidence.length ? (
+            <div className="grid-selection-detail-list">
+              {selected.evidence.map((evidence) => (
+                <div className="grid-selection-detail-item" key={evidence.id}>
+                  <div className="grid-selection-detail-info">
+                    <strong title={evidence.fileName}>{evidence.fileName}</strong>
+                    <span>Page {evidence.page} · {evidence.text || "Area highlight"}</span>
+                  </div>
+                  <button type="button" onClick={() => onJump(evidence)} aria-label={`Open evidence in ${evidence.fileName}, page ${evidence.page}`}>
+                    Open PDF
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onUnlink(evidence, selected.mark)}
+                    aria-label={`Unlink evidence in ${evidence.fileName}, page ${evidence.page}`}
+                  >
+                    Unlink
+                  </button>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+          ) : (
+            <p>No linked evidence. Select this row in Link mode to add a highlight.</p>
+          )}
+        </section>
       ) : null}
     </div>
   );

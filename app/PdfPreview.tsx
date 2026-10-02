@@ -4,8 +4,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   annotationLabelFont,
   annotationLabelFontStyle,
+  findAutomaticAnnotationLabelPosition,
+  getAnnotationLabelConnector,
   getAnnotationLabelLayout,
 } from "./annotationLabel.mts";
+import type { AnnotationRect } from "./annotationLabel.mts";
 import {
   create,
   PDFSlick,
@@ -13,8 +16,43 @@ import {
 import type { PDFException, PDFSlickOptions } from "@pdfslick/core";
 import { createStore, PDFSlickViewer } from "@pdfslick/react";
 import { Highlighter, Link2, MessageSquare } from "lucide-react";
+import { selectionAction } from "./highlightIntent.mts";
 
 type AreaRect = { x: number; y: number; width: number; height: number };
+
+function sourcePageCanvas(page: HTMLElement) {
+  return page.querySelector<HTMLCanvasElement>(".canvasWrapper canvas") ??
+    page.querySelector<HTMLCanvasElement>("canvas:not(.page-annotation-canvas)");
+}
+
+function renderedInkFraction(page: HTMLElement, rect: AnnotationRect) {
+  const canvas = sourcePageCanvas(page);
+  const context = canvas?.getContext("2d");
+  if (!canvas || !context || !canvas.width || !canvas.height) return 0;
+  const pageBounds = page.getBoundingClientRect();
+  const canvasBounds = canvas.getBoundingClientRect();
+  if (!canvasBounds.width || !canvasBounds.height) return 0;
+  const pixelX = Math.max(0, Math.floor((pageBounds.left + rect.x - canvasBounds.left) * canvas.width / canvasBounds.width));
+  const pixelY = Math.max(0, Math.floor((pageBounds.top + rect.y - canvasBounds.top) * canvas.height / canvasBounds.height));
+  const pixelWidth = Math.min(canvas.width - pixelX, Math.ceil(rect.width * canvas.width / canvasBounds.width));
+  const pixelHeight = Math.min(canvas.height - pixelY, Math.ceil(rect.height * canvas.height / canvasBounds.height));
+  if (pixelWidth <= 0 || pixelHeight <= 0) return 0;
+  try {
+    const { data } = context.getImageData(pixelX, pixelY, pixelWidth, pixelHeight);
+    let ink = 0;
+    let samples = 0;
+    for (let y = 0; y < pixelHeight; y += 3) {
+      for (let x = 0; x < pixelWidth; x += 3) {
+        const index = (y * pixelWidth + x) * 4;
+        samples += 1;
+        if (data[index + 3] > 32 && (data[index] + data[index + 1] + data[index + 2]) / 3 < 245) ink += 1;
+      }
+    }
+    return samples ? ink / samples : 0;
+  } catch {
+    return 0;
+  }
+}
 type DocumentPoint = {
   x: number;
   y: number;
@@ -32,6 +70,8 @@ type MarkSelection = {
 
 export type EvidenceMark = {
   id: string;
+  documentId?: string;
+  reviewRole?: "highlight" | "requirement";
   side: "tor" | "catalog";
   fileName: string;
   fileUrl?: string;
@@ -56,11 +96,18 @@ export default function PdfPreview({
   side,
   pendingLinkId,
   interactionMode,
+  evidenceTargetRowId,
   marks,
   requirementNumberByLinkId,
+  requirementNumbersByMarkId,
   renderAnnotations = true,
   onMoveMark,
+  onAutoPlaceMark,
   onCreateMark,
+  neutralLinking = false,
+  onStatusChange,
+  initialView,
+  onViewChange,
 }: {
   file: File;
   url: string;
@@ -68,16 +115,24 @@ export default function PdfPreview({
   side: "tor" | "catalog";
   pendingLinkId: string | null;
   interactionMode: "highlight" | "link";
+  evidenceTargetRowId?: string | null;
   marks: EvidenceMark[];
   requirementNumberByLinkId?: ReadonlyMap<string, string>;
+  requirementNumbersByMarkId?: ReadonlyMap<string, readonly string[]>;
   renderAnnotations?: boolean;
   onMoveMark?: (
     id: string,
     position: DocumentPoint,
     offset: DocumentPoint,
   ) => void;
+  onAutoPlaceMark?: (id: string, position: DocumentPoint) => void;
   onCreateMark: (mark: EvidenceMark, intent: "highlight" | "link") => void;
+  neutralLinking?: boolean;
+  onStatusChange?: (status: "opening" | "ready" | "error", pageCount?: number, message?: string) => void;
+  initialView?: { page: number; scale: number };
+  onViewChange?: (view: { page: number; scale: number }) => void;
 }) {
+  const initialViewRef = useRef(initialView);
   const [container, setContainer] = useState<HTMLElement | null>(null);
   const [error, setError] = useState<PDFException | null>(null);
   const [isDocumentLoaded, setIsDocumentLoaded] = useState(false);
@@ -92,6 +147,10 @@ export default function PdfPreview({
   } | null>(null);
   const rangesRef = useRef(new Map<string, Range>());
   const areaJustFinishedRef = useRef(false);
+
+  useEffect(() => {
+    setSelection(null);
+  }, [evidenceTargetRowId]);
   const store = useMemo(() => create(), []);
   const usePDFSlickStore = useMemo(() => createStore(store), [store]);
   const options = useMemo<PDFSlickOptions>(
@@ -115,6 +174,18 @@ export default function PdfPreview({
   const scale = usePDFSlickStore((state) => state.scale);
 
   useEffect(() => {
+    if (error) onStatusChange?.("error", undefined, error.message);
+    else if (isDocumentLoaded && numPages) onStatusChange?.("ready", numPages);
+    else onStatusChange?.("opening");
+  }, [error, isDocumentLoaded, numPages, onStatusChange]);
+
+  useEffect(() => {
+    if (isDocumentLoaded && numPages && pageNumber > 0 && Number.isFinite(scale) && scale > 0) {
+      onViewChange?.({ page: pageNumber, scale });
+    }
+  }, [isDocumentLoaded, numPages, pageNumber, scale, onViewChange]);
+
+  useEffect(() => {
     if (!isDocumentLoaded || !container || !renderAnnotations) return;
 
     const restoreHighlights = window.setTimeout(() => {
@@ -125,6 +196,34 @@ export default function PdfPreview({
         .forEach((element) => element.remove());
 
       const canvases = new Map<HTMLElement, CanvasRenderingContext2D>();
+      const occupiedLabels = new Map<HTMLElement, AnnotationRect[]>();
+      const obstaclesByPage = new Map<HTMLElement, AnnotationRect[]>();
+      const contentObstacles = (page: HTMLElement) => {
+        const cached = obstaclesByPage.get(page);
+        if (cached) return cached;
+        const pageBounds = page.getBoundingClientRect();
+        const textRects = Array.from(page.querySelectorAll<HTMLElement>(".textLayer span"))
+          .map((span) => span.getBoundingClientRect())
+          .filter((rect) => rect.width > 0 && rect.height > 0)
+          .map((rect) => ({
+            x: rect.left - pageBounds.left,
+            y: rect.top - pageBounds.top,
+            width: rect.width,
+            height: rect.height,
+          }));
+        const highlightRects = marks
+          .filter((item) => item.page === Number(page.dataset.pageNumber))
+          .flatMap((item) => item.area ? [item.area] : item.annotation?.rects ?? [])
+          .map((rect) => ({
+            x: rect.x * pageBounds.width,
+            y: rect.y * pageBounds.height,
+            width: rect.width * pageBounds.width,
+            height: rect.height * pageBounds.height,
+          }));
+        const obstacles = [...textRects, ...highlightRects];
+        obstaclesByPage.set(page, obstacles);
+        return obstacles;
+      };
       const drawAnnotation = (mark: EvidenceMark, page: HTMLElement, rects: AreaRect[]) => {
         if (!rects.length) return;
         let context = canvases.get(page);
@@ -166,13 +265,42 @@ export default function PdfPreview({
             context.stroke();
           }
         });
-        const requirementNo = mark.linkId ? requirementNumberByLinkId?.get(mark.linkId) : undefined;
+        const requirementNo = requirementNumbersByMarkId?.get(mark.id)?.join(" · #") ??
+          (mark.linkId ? requirementNumberByLinkId?.get(mark.linkId) : undefined);
         const anchor = mark.annotation ?? (mark.area ? { x: mark.area.x, y: mark.area.y } : undefined);
         if (!requirementNo || !anchor) return;
-        const labelAnchor = mark.area ? anchor : anchor.rects?.[0] ?? anchor;
+        const labelAnchor = mark.area ?? anchor.rects?.find((rect) => rect.width > 0 && rect.height > 0) ?? anchor;
         const fontSize = annotationLabelFont(width);
         context.font = annotationLabelFontStyle(fontSize);
         const label = `#${requirementNo}`;
+        const textWidth = context.measureText(label).width;
+        const anchorRect = {
+          x: labelAnchor.x * width,
+          y: labelAnchor.y * height,
+          width: ("width" in labelAnchor ? labelAnchor.width : 0) * width,
+          height: ("height" in labelAnchor ? labelAnchor.height : 0) * height,
+        };
+        const preferredLayout = getAnnotationLabelLayout({
+          pageWidth: width,
+          pageHeight: height,
+          textWidth,
+          anchor: labelAnchor,
+          position: mark.labelPosition,
+          offset: mark.labelOffset,
+        });
+        const pageLabels = occupiedLabels.get(page) ?? [];
+        const automaticPosition = !mark.labelPosition
+          ? findAutomaticAnnotationLabelPosition({
+              pageWidth: width,
+              pageHeight: height,
+              labelWidth: preferredLayout.width,
+              labelHeight: preferredLayout.height,
+              anchor: anchorRect,
+              obstacles: contentObstacles(page),
+              occupied: pageLabels,
+              inkFraction: (rect) => renderedInkFraction(page, rect),
+            })
+          : null;
         const {
           x,
           y,
@@ -182,18 +310,35 @@ export default function PdfPreview({
           paddingY,
           homeX,
           homeY,
-        } = getAnnotationLabelLayout({
+        } = automaticPosition ? getAnnotationLabelLayout({
           pageWidth: width,
           pageHeight: height,
-          textWidth: context.measureText(label).width,
+          textWidth,
           anchor: labelAnchor,
-          position: mark.labelPosition,
-          offset: mark.labelOffset,
-        });
+          position: { x: automaticPosition.x / width, y: automaticPosition.y / height },
+        }) : preferredLayout;
+        pageLabels.push({ x, y, width: labelWidth, height: labelHeight });
+        occupiedLabels.set(page, pageLabels);
+        const connector = getAnnotationLabelConnector(
+          { x, y, width: labelWidth, height: labelHeight },
+          anchorRect,
+        );
+        if (connector) {
+          context.beginPath();
+          context.moveTo(connector.start.x, connector.start.y);
+          context.lineTo(connector.end.x, connector.end.y);
+          context.strokeStyle = "#1d4ed8";
+          context.lineWidth = Math.max(1, width * 0.0014);
+          context.stroke();
+        }
         context.fillStyle = "#1d4ed8";
         context.fillRect(x, y, labelWidth, labelHeight);
         context.fillStyle = "#eff6ff";
         context.fillText(label, x + paddingX, y + labelHeight - paddingY - fontSize * 0.16);
+
+        if (automaticPosition && onAutoPlaceMark) {
+          onAutoPlaceMark(mark.id, { x: x / width, y: y / height });
+        }
 
         if (!onMoveMark) return;
 
@@ -269,7 +414,10 @@ export default function PdfPreview({
         });
       };
 
-      for (const mark of marks) {
+      const orderedMarks = [...marks].sort((first, second) =>
+        Number(Boolean(second.labelPosition)) - Number(Boolean(first.labelPosition)),
+      );
+      for (const mark of orderedMarks) {
         if (mark.area) {
           const page = container.querySelector<HTMLElement>(
             `.page[data-page-number="${mark.page}"]`,
@@ -334,13 +482,13 @@ export default function PdfPreview({
         // caller can safely navigate as soon as this document is ready; the
         // jump handler will render the requested page before centring it.
         window.dispatchEvent(
-          new CustomEvent("comparex:mark-ready", { detail: mark.id }),
+          new CustomEvent("comparex:mark-ready", { detail: { id: mark.id, side } }),
         );
       }
     }, 100);
 
     return () => window.clearTimeout(restoreHighlights);
-  }, [container, isDocumentLoaded, marks, onMoveMark, renderAnnotations, requirementNumberByLinkId, scale, side]);
+  }, [container, isDocumentLoaded, marks, onAutoPlaceMark, onMoveMark, renderAnnotations, requirementNumberByLinkId, requirementNumbersByMarkId, scale, side]);
 
   const commitMark = (
     candidate: MarkSelection,
@@ -367,7 +515,7 @@ export default function PdfPreview({
           (candidate.area ? { x: candidate.area.x, y: candidate.area.y } : undefined),
         note,
         linkId:
-          intent === "link" && (side === "catalog" || side === "tor")
+          !neutralLinking && intent === "link" && (side === "catalog" || side === "tor")
             ? pendingLinkId ?? undefined
             : undefined,
       },
@@ -379,6 +527,18 @@ export default function PdfPreview({
 
   const createMark = (intent: "highlight" | "link", note?: string) => {
     if (selection) commitMark(selection, intent, note);
+  };
+
+  const commitSelectionOrShowToolbar = (candidate: MarkSelection) => {
+    const action = selectionAction({
+      interactionMode,
+      neutralLinking,
+      side,
+      pendingLinkId,
+      evidenceTargetRowId: evidenceTargetRowId ?? null,
+    });
+    if (action === "toolbar") setSelection(candidate);
+    else commitMark(candidate, action);
   };
 
   const captureSelection = () => {
@@ -424,13 +584,7 @@ export default function PdfPreview({
       x: Math.min(window.innerWidth - 210, Math.max(12, bounds.left)),
       y: Math.max(12, bounds.top - 46),
     };
-    if (interactionMode === "link" && side === "tor") {
-      commitMark(nextSelection, "link");
-    } else if (side === "catalog" && pendingLinkId) {
-      commitMark(nextSelection, "link");
-    } else {
-      setSelection(nextSelection);
-    }
+    commitSelectionOrShowToolbar(nextSelection);
   };
 
   const startAreaSelection = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -491,13 +645,7 @@ export default function PdfPreview({
         x: Math.min(window.innerWidth - 210, Math.max(12, left)),
         y: Math.max(12, top - 46),
       };
-      if (interactionMode === "link" && side === "tor") {
-        commitMark(nextSelection, "link");
-      } else if (side === "catalog" && pendingLinkId) {
-        commitMark(nextSelection, "link");
-      } else {
-        setSelection(nextSelection);
-      }
+      commitSelectionOrShowToolbar(nextSelection);
     }
     setAreaDraft(null);
   };
@@ -521,7 +669,12 @@ export default function PdfPreview({
       });
       store.setState({ pdfSlick: slick });
       void slick.loadDocument(url, options).then(() => {
-        if (isActive) setIsDocumentLoaded(true);
+        if (isActive) {
+          const view = initialViewRef.current;
+          if (view?.scale && Number.isFinite(view.scale) && view.scale > 0) slick!.currentScale = view.scale;
+          if (view?.page && Number.isInteger(view.page) && view.page > 0) slick!.gotoPage(view.page);
+          setIsDocumentLoaded(true);
+        }
       });
     }, 0);
 
@@ -539,7 +692,9 @@ export default function PdfPreview({
 
   useEffect(() => {
     const jumpToMark = (event: Event) => {
-      const id = (event as CustomEvent<string>).detail;
+      const detail = (event as CustomEvent<string | { id: string; side: "tor" | "catalog" }>).detail;
+      const id = typeof detail === "string" ? detail : detail.id;
+      if (typeof detail !== "string" && detail.side !== side) return;
       const mark = marks.find((item) => item.id === id);
       if (!mark || !container) return;
 
@@ -627,16 +782,16 @@ export default function PdfPreview({
           <button
             type="button"
             onClick={() => createMark("link")}
-            aria-label={side === "tor" ? "Start evidence link" : "Link selected evidence"}
-            title={side === "tor" ? "Link evidence" : "Link to TOR"}
-            disabled={side === "catalog" && !pendingLinkId}
+            aria-label={neutralLinking ? "Link selected highlight" : side === "tor" ? "Start evidence link" : "Link selected evidence"}
+            title={neutralLinking ? "Link highlight" : side === "tor" ? "Link evidence" : "Link to TOR"}
+            disabled={!neutralLinking && side === "catalog" && !pendingLinkId}
           >
             <Link2 aria-hidden="true" size={16} />
           </button>
           <button
             type="button"
             onClick={() => {
-              const note = window.prompt("Note for this evidence");
+              const note = window.prompt("Note for this highlight");
               if (note !== null) createMark("highlight", note.trim());
             }}
             aria-label="Add note to selected text"

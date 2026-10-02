@@ -3,7 +3,11 @@ import { File } from "node:buffer";
 import test from "node:test";
 import { PDFDocument } from "pdf-lib";
 import { createAnnotatedPdf } from "../app/annotatedPdf.mts";
-import { getAnnotationLabelLayout } from "../app/annotationLabel.mts";
+import {
+  findAutomaticAnnotationLabelPosition,
+  getAnnotationLabelConnector,
+  getAnnotationLabelLayout,
+} from "../app/annotationLabel.mts";
 
 const transparentPng =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+X6ixAAAAAElFTkSuQmCC";
@@ -103,6 +107,82 @@ test("label layout uses the same normalized position at screen and PDF sizes", (
   assert.equal(screen.height / 1400, pdf.height / 700);
   assert.equal(screen.homeX / 1000, pdf.homeX / 500);
   assert.equal(screen.homeY / 1400, pdf.homeY / 700);
+});
+
+test("default badge touches the left border of its highlight", () => {
+  const layout = getAnnotationLabelLayout({
+    pageWidth: 400,
+    pageHeight: 500,
+    textWidth: 24,
+    anchor: { x: 0.4, y: 0.3 },
+  });
+  assert.equal(layout.x + layout.width, 160);
+  assert.equal(layout.y, 150);
+  assert.equal(getAnnotationLabelConnector(
+    { x: layout.x, y: layout.y, width: layout.width, height: layout.height },
+    { x: 160, y: 150, width: 90, height: 30 },
+  ), null);
+});
+
+test("a displaced badge connects to its highlight border", () => {
+  assert.deepEqual(getAnnotationLabelConnector(
+    { x: 50, y: 80, width: 30, height: 16 },
+    { x: 100, y: 80, width: 90, height: 30 },
+  ), {
+    start: { x: 80, y: 95 },
+    end: { x: 100, y: 95 },
+  });
+});
+
+test("automatic badge attaches to another edge when the left page edge is crowded", () => {
+  const placement = findAutomaticAnnotationLabelPosition({
+    pageWidth: 400,
+    pageHeight: 400,
+    labelWidth: 30,
+    labelHeight: 16,
+    anchor: { x: 4, y: 100, width: 40, height: 25 },
+    obstacles: [{ x: 0, y: 100, width: 44, height: 25 }],
+    occupied: [],
+  });
+  assert.deepEqual(placement, { x: 4, y: 84 });
+  assert.equal(getAnnotationLabelConnector(
+    { ...placement, width: 30, height: 16 },
+    { x: 4, y: 100, width: 40, height: 25 },
+  ), null);
+});
+
+test("automatic label placement moves out of a heading and stays near its highlight", () => {
+  const placement = findAutomaticAnnotationLabelPosition({
+    pageWidth: 300,
+    pageHeight: 400,
+    labelWidth: 30,
+    labelHeight: 16,
+    anchor: { x: 100, y: 100, width: 120, height: 50 },
+    obstacles: [
+      { x: 98, y: 79, width: 150, height: 22 },
+      { x: 100, y: 100, width: 120, height: 50 },
+    ],
+    occupied: [],
+  });
+  assert.ok(placement.x < 100);
+  assert.ok(placement.y >= 0);
+});
+
+test("automatic label placement avoids another badge and rendered ink", () => {
+  const placement = findAutomaticAnnotationLabelPosition({
+    pageWidth: 400,
+    pageHeight: 400,
+    labelWidth: 30,
+    labelHeight: 16,
+    anchor: { x: 120, y: 120, width: 40, height: 25 },
+    obstacles: [{ x: 120, y: 101, width: 45, height: 20 }],
+    occupied: [{ x: 85, y: 115, width: 35, height: 25 }],
+    inkFraction: (rect) => rect.x === 120 && rect.y === 104 ? 1 : 0,
+  });
+  assert.ok(placement.x >= 0 && placement.x + 30 <= 400);
+  assert.ok(placement.y >= 0 && placement.y + 16 <= 400);
+  assert.notDeepEqual(placement, { x: 120, y: 104 });
+  assert.ok(placement.x >= 120 || placement.y >= 140);
 });
 
 test("label offsets remain proportional when a badge was moved", () => {

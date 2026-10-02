@@ -6,7 +6,9 @@ import {
   MouseEvent,
   PointerEvent,
   ReactNode,
+  useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -18,9 +20,12 @@ import {
   Download,
   FileText,
   Files as FilesIcon,
+  FolderOpen,
+  Table2,
   GripVertical,
   Highlighter,
   Link2,
+  MoreHorizontal,
   Pin,
   PinOff,
   Plus,
@@ -41,6 +46,32 @@ import {
   normalizeRequirementStartPath,
   toAsciiDigits,
 } from "./requirementNumbering.mts";
+import {
+  readWorkspaceIndex,
+  saveWorkspaceIndex,
+  workspaceHandleKey,
+  workspaceStateKey,
+  type WorkspaceIndex,
+} from "./workspaceStore.mts";
+import {
+  closeWorkspaceTab,
+  emptyWorkspaceTabs,
+  initialWorkspaceTabs,
+  openWorkspaceTab,
+  removeWorkspaceDocumentTabs,
+  restoreReviewTableTabs,
+  reviewTableId,
+  type PaneTabs,
+  type WorkspaceTabs,
+} from "./workspaceTabs.mts";
+import {
+  addWorkspaceLink,
+  removeWorkspaceLinkBetween,
+  removeWorkspaceLinksForItems,
+  type WorkspaceLink,
+} from "./workspaceLinks.mts";
+import { nextRequirementRowId, requirementNumbersByEvidenceMark, tableEvidenceForRow, unassignedTableHighlights } from "./workspaceTable.mts";
+import { explorerDisplayName } from "./explorerName.mts";
 
 const PdfPreview = dynamic(() => import("./PdfPreview"), {
   ssr: false,
@@ -53,11 +84,26 @@ const RequirementGrid = dynamic(() => import("./RequirementGrid"), {
 });
 
 type Slot = "left" | "right";
+type DocumentView = { page: number; scale: number };
 
 type UploadedFile = {
+  id: string;
   file: File;
   url: string;
 };
+
+type WorkspaceDocument = {
+  id: string;
+  name: string;
+  sourceName: string;
+  size: number | null;
+  sha256?: string;
+  pageCount?: number;
+  handleKey: string;
+};
+
+type ReviewTableItem = { id: string; name: string; kind: "review-table" };
+type EditorItem = { id: string; name: string; kind: "pdf" | "review-table" };
 
 type SelectedDocument = {
   file: File;
@@ -89,10 +135,206 @@ declare global {
   }
 }
 
+export default function Home() {
+  const [workspaceIndex, setWorkspaceIndex] = useState<WorkspaceIndex | null>(null);
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [newName, setNewName] = useState("");
+  const [showCreate, setShowCreate] = useState(false);
+  const indexRef = useRef<WorkspaceIndex | null>(null);
+
+  const applyIndex = useCallback((next: WorkspaceIndex) => {
+    saveWorkspaceIndex(window.localStorage, next);
+    indexRef.current = next;
+    setWorkspaceIndex(next);
+  }, []);
+
+  useEffect(() => {
+    try {
+      const next = readWorkspaceIndex(
+        window.localStorage,
+        () => crypto.randomUUID(),
+        () => new Date().toISOString(),
+      );
+      indexRef.current = next;
+      setWorkspaceIndex(next);
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error));
+    }
+  }, []);
+
+  const openWorkspace = (id: string) => {
+    const current = indexRef.current;
+    if (!current || !current.items.some((item) => item.id === id)) return;
+    try {
+      applyIndex({ ...current, activeId: id });
+      setShowCreate(false);
+      setWorkspaceError("");
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error));
+    }
+  };
+
+  const closeWorkspace = () => {
+    const current = indexRef.current;
+    if (!current) return;
+    try {
+      applyIndex({ ...current, activeId: null });
+      setShowCreate(false);
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error));
+    }
+  };
+
+  const newWorkspace = () => {
+    closeWorkspace();
+    setNewName("");
+    setShowCreate(true);
+  };
+
+  const createWorkspace = () => {
+    const current = indexRef.current;
+    if (!current) return;
+    const id = crypto.randomUUID();
+    const name = sanitizeWorkspaceName(newName) || "Untitled workspace";
+    try {
+      applyIndex({
+        ...current,
+        activeId: id,
+        items: [{ id, name, savedAt: new Date().toISOString() }, ...current.items],
+      });
+      setShowCreate(false);
+      setWorkspaceError("");
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error));
+    }
+  };
+
+  const workspaceSaved = useCallback((id: string, name: string, savedAt: string) => {
+    const current = indexRef.current;
+    if (!current) return;
+    const next = {
+      ...current,
+      items: current.items.map((item) =>
+        item.id === id
+          ? { ...item, name: sanitizeWorkspaceName(name) || "Untitled workspace", savedAt }
+          : item,
+      ),
+    };
+    try {
+      saveWorkspaceIndex(window.localStorage, next);
+      indexRef.current = next;
+      setWorkspaceIndex(next);
+    } catch {
+      setWorkspaceError("Could not update the workspace list in browser storage.");
+    }
+  }, []);
+
+  const deleteWorkspace = async (id: string) => {
+    const current = indexRef.current;
+    const target = current?.items.find((item) => item.id === id);
+    if (!current || !target || !window.confirm(
+      `Delete “${target.name}” and its local review data? Original PDF files remain on your device.`,
+    )) return;
+    let snapshot: string | null = null;
+    let snapshotRemoved = false;
+    try {
+      snapshot = window.localStorage.getItem(workspaceStateKey(id));
+      const saved = snapshot ? JSON.parse(snapshot) as PersistedWorkspaceState : null;
+      const keys = saved?.documents?.map((item) => item.handleKey) ?? [
+        ...(saved?.files?.torName ? ["tor"] : []),
+        ...(saved?.files?.evidenceNames ?? []).map((name) => `catalog:${name}`),
+      ];
+      if (!await clearFileHandles(keys)) throw new Error("Could not remove saved file access.");
+      window.localStorage.removeItem(workspaceStateKey(id));
+      snapshotRemoved = true;
+      applyIndex({
+        ...current,
+        activeId: current.activeId === id ? null : current.activeId,
+        items: current.items.filter((item) => item.id !== id),
+      });
+    } catch (error) {
+      if (snapshotRemoved && snapshot) {
+        try { window.localStorage.setItem(workspaceStateKey(id), snapshot); } catch { /* Preserve the error below. */ }
+      }
+      setWorkspaceError(getErrorMessage(error));
+      window.alert(`Could not delete this workspace: ${getErrorMessage(error)}`);
+    }
+  };
+
+  if (!workspaceIndex) {
+    return <main className="workspace-start"><p role="status">{workspaceError || "Opening workspaces..."}</p></main>;
+  }
+
+  if (workspaceIndex.activeId && !showCreate) {
+    return (
+      <ReviewWorkspace
+        key={workspaceIndex.activeId}
+        workspaceId={workspaceIndex.activeId}
+        initialName={workspaceIndex.items.find((item) => item.id === workspaceIndex.activeId)?.name ?? "Untitled workspace"}
+        workspaces={workspaceIndex.items}
+        onWorkspaceSaved={workspaceSaved}
+        onOpenWorkspace={openWorkspace}
+        onNewWorkspace={newWorkspace}
+        onCloseWorkspace={closeWorkspace}
+        onDeleteWorkspace={(id) => void deleteWorkspace(id)}
+      />
+    );
+  }
+
+  return (
+    <main className="workspace-start">
+      <header className="workspace-start-header">
+        <Image src={comparexLogo} alt="COMPAREX" width={158} priority />
+        <span>Local PDF workspaces</span>
+      </header>
+      <section className="workspace-start-content" aria-labelledby="workspaces-title">
+        <div className="workspace-start-heading">
+          <div>
+            <h1 id="workspaces-title">Workspaces</h1>
+            <p>Open a recent review or create a workspace with a Review Table and PDF documents.</p>
+          </div>
+          {!showCreate ? <button type="button" onClick={newWorkspace}><Plus size={17} aria-hidden="true" /> New Workspace</button> : null}
+        </div>
+        {workspaceError ? <p className="error-message" role="alert">{workspaceError}</p> : null}
+        {showCreate ? (
+          <form className="workspace-create" onSubmit={(event) => { event.preventDefault(); createWorkspace(); }}>
+            <label htmlFor="new-workspace-name">Workspace name</label>
+            <input
+              id="new-workspace-name"
+              autoFocus
+              value={newName}
+              maxLength={80}
+              placeholder="Untitled workspace"
+              onChange={(event) => setNewName(event.target.value)}
+            />
+            <p>You can add PDFs after creating the workspace.</p>
+            <div>
+              <button type="button" onClick={() => setShowCreate(false)}>Cancel</button>
+              <button type="submit">Create Workspace</button>
+            </div>
+          </form>
+        ) : workspaceIndex.items.length ? (
+          <ul className="workspace-recent-list">
+            {[...workspaceIndex.items].sort((a, b) => b.savedAt.localeCompare(a.savedAt)).map((item) => (
+              <li key={item.id}>
+                <button type="button" onClick={() => openWorkspace(item.id)}>
+                  <FolderOpen size={20} aria-hidden="true" />
+                  <span><strong>{item.name}</strong><small>Saved locally · {new Date(item.savedAt).toLocaleString()}</small></span>
+                  <ChevronRight size={17} aria-hidden="true" />
+                </button>
+                <button type="button" className="workspace-recent-remove" onClick={() => void deleteWorkspace(item.id)} aria-label={`Delete ${item.name}`} title="Delete workspace"><Trash2 size={16} aria-hidden="true" /></button>
+              </li>
+            ))}
+          </ul>
+        ) : <p className="workspace-start-empty">No workspaces yet. Create one to begin reviewing PDFs.</p>}
+      </section>
+    </main>
+  );
+}
+
 type ReviewFilter = "all" | "unlinked" | "linked";
 
-const acceptedExtensions = [".pdf", ".docx"];
-const workspaceStorageKey = "comparex.workspace.v1";
+const acceptedExtensions = [".pdf"];
 const fileHandleDatabaseName = "comparex-file-handles";
 const fileHandleStoreName = "handles";
 
@@ -113,10 +355,11 @@ type PrintableFileFailure = {
 };
 
 type PersistedWorkspaceState = {
-  version: 1;
+  version: 1 | 2;
   savedAt: string;
   workspaceName?: string;
   marks: EvidenceMark[];
+  links?: WorkspaceLink[];
   panel: {
     leftWidth: number;
     requirementStartNumber?: number;
@@ -126,7 +369,10 @@ type PersistedWorkspaceState = {
     showTorPane?: boolean;
     showEvidencePane?: boolean;
     reviewFilter: ReviewFilter;
+    reviewView?: "highlights" | "rows";
     interactionMode: "highlight" | "link";
+    documentViews?: Record<string, DocumentView>;
+    explorerWidth?: number;
   };
   catalogLabelOffset: { x: number; y: number } | null;
   collapsedRequirementIds: string[];
@@ -135,6 +381,9 @@ type PersistedWorkspaceState = {
     activeEvidenceName: string | null;
     evidenceNames: string[];
   };
+  documents?: WorkspaceDocument[];
+  reviewTable?: ReviewTableItem;
+  tabs?: WorkspaceTabs;
 };
 
 function isAcceptedFile(file: File) {
@@ -144,6 +393,11 @@ function isAcceptedFile(file: File) {
 
 function isPdfFile(file: File) {
   return file.name.toLowerCase().endsWith(".pdf");
+}
+
+async function sha256File(file: File) {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function formatFileSize(bytes: number) {
@@ -175,29 +429,30 @@ function sanitizeWorkspaceName(value: string) {
   return value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function readPersistedWorkspace(): PersistedWorkspaceState | null {
+function readPersistedWorkspace(workspaceId: string): PersistedWorkspaceState | null {
+  const raw = window.localStorage.getItem(workspaceStateKey(workspaceId));
+  if (!raw) return null;
   try {
-    const raw = window.localStorage.getItem(workspaceStorageKey);
-    if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<PersistedWorkspaceState>;
-    if (parsed.version !== 1) return null;
+    if (parsed.version !== 1 && parsed.version !== 2) throw new Error("Unsupported workspace format");
     return parsed as PersistedWorkspaceState;
   } catch {
-    return null;
+    throw new Error("Saved workspace data could not be read. It was kept unchanged.");
   }
 }
 
-function writePersistedWorkspace(state: PersistedWorkspaceState) {
+function writePersistedWorkspace(workspaceId: string, state: PersistedWorkspaceState) {
   try {
-    window.localStorage.setItem(workspaceStorageKey, JSON.stringify(state));
+    window.localStorage.setItem(workspaceStateKey(workspaceId), JSON.stringify(state));
+    return true;
   } catch {
-    // Storage can be unavailable in private windows or full browser profiles.
+    return false;
   }
 }
 
-function clearPersistedWorkspace() {
+function clearPersistedWorkspace(workspaceId: string) {
   try {
-    window.localStorage.removeItem(workspaceStorageKey);
+    window.localStorage.removeItem(workspaceStateKey(workspaceId));
     return true;
   } catch {
     return false;
@@ -266,13 +521,14 @@ async function deleteFileHandle(key: string) {
   }
 }
 
-async function clearFileHandles() {
+async function clearFileHandles(keys: string[]) {
   if (!("indexedDB" in window)) return true;
   try {
     const database = await openFileHandleDatabase();
     return await new Promise<boolean>((resolve) => {
       const transaction = database.transaction(fileHandleStoreName, "readwrite");
-      transaction.objectStore(fileHandleStoreName).clear();
+      const store = transaction.objectStore(fileHandleStoreName);
+      keys.forEach((key) => store.delete(key));
       transaction.oncomplete = () => {
         database.close();
         resolve(true);
@@ -333,8 +589,10 @@ function DropPanel({
   title,
   tone,
   uploadedFile,
+  missingDocument,
   multiple = false,
   onSelect,
+  onOpenDocumentDrop,
   onClear,
   toolbar,
   previewProps,
@@ -343,22 +601,31 @@ function DropPanel({
   title: string;
   tone: "version-a" | "version-b";
   uploadedFile: UploadedFile | null;
+  missingDocument?: string;
   multiple?: boolean;
   onSelect: (documents: SelectedDocument[]) => void;
+  onOpenDocumentDrop?: (documentId: string) => void;
   onClear?: () => void;
   toolbar?: ReactNode;
   previewProps?: {
     side: "tor" | "catalog";
     pendingLinkId: string | null;
     interactionMode: "highlight" | "link";
+    evidenceTargetRowId?: string | null;
     marks: EvidenceMark[];
+    neutralLinking?: boolean;
+    onStatusChange?: (status: "opening" | "ready" | "error", pageCount?: number, message?: string) => void;
+    initialView?: DocumentView;
+    onViewChange?: (view: DocumentView) => void;
     requirementNumberByLinkId?: ReadonlyMap<string, string>;
+    requirementNumbersByMarkId?: ReadonlyMap<string, readonly string[]>;
     onCreateMark: (mark: EvidenceMark, intent: "highlight" | "link") => void;
     onMoveMark?: (
       id: string,
       position: { x: number; y: number },
       offset: { x: number; y: number },
     ) => void;
+    onAutoPlaceMark?: (id: string, position: { x: number; y: number }) => void;
   };
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -374,7 +641,7 @@ function DropPanel({
 
     setError(
       rejected
-        ? `ไม่เพิ่ม ${rejected} ไฟล์: รองรับเฉพาะ PDF และ DOCX`
+        ? `ไม่เพิ่ม ${rejected} ไฟล์: รองรับเฉพาะ PDF`
         : "",
     );
     if (accepted.length) onSelect(accepted);
@@ -387,13 +654,8 @@ function DropPanel({
           multiple,
           types: [
             {
-              description: "PDF and Word documents",
-              accept: {
-                "application/pdf": [".pdf"],
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [
-                  ".docx",
-                ],
-              },
+              description: "PDF documents",
+              accept: { "application/pdf": [".pdf"] },
             },
           ],
         });
@@ -422,6 +684,11 @@ function DropPanel({
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
+    const documentId = event.dataTransfer.getData("application/x-comparex-document");
+    if (documentId && onOpenDocumentDrop) {
+      onOpenDocumentDrop(documentId);
+      return;
+    }
     pickDocuments(await getDroppedDocuments(event));
   };
 
@@ -483,7 +750,7 @@ function DropPanel({
           className="sr-only"
           type="file"
           multiple={multiple}
-          accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          accept=".pdf,application/pdf"
           onChange={onInputChange}
         />
 
@@ -497,25 +764,37 @@ function DropPanel({
               side={previewProps?.side ?? "tor"}
               pendingLinkId={previewProps?.pendingLinkId ?? null}
               interactionMode={previewProps?.interactionMode ?? "highlight"}
+              evidenceTargetRowId={previewProps?.evidenceTargetRowId}
               marks={previewProps?.marks ?? []}
+              neutralLinking={previewProps?.neutralLinking}
+              onStatusChange={previewProps?.onStatusChange}
+              initialView={previewProps?.initialView}
+              onViewChange={previewProps?.onViewChange}
               requirementNumberByLinkId={previewProps?.requirementNumberByLinkId}
+              requirementNumbersByMarkId={previewProps?.requirementNumbersByMarkId}
               onCreateMark={previewProps?.onCreateMark ?? (() => undefined)}
               onMoveMark={previewProps?.onMoveMark}
+              onAutoPlaceMark={previewProps?.onAutoPlaceMark}
             />
           ) : (
             <div className="file-state">
               <div className="file-icon" aria-hidden="true">
-                DOCX
+                FILE
               </div>
               <div className="file-details">
                 <strong>{uploadedFile.file.name}</strong>
                 <span>{formatFileSize(uploadedFile.file.size)}</span>
               </div>
               <span className="docx-note">
-                DOCX preview จะต่อด้วย docx-preview ในเฟสถัดไป
+                This document cannot be previewed. Add a PDF to continue.
               </span>
             </div>
           )
+        ) : missingDocument ? (
+          <div className="empty-state">
+            <strong>Cannot open {missingDocument}</strong>
+            <span>Select the original PDF again in Explorer to restore access.</span>
+          </div>
         ) : (
           <div className="empty-state">
             <div className="upload-mark" aria-hidden="true">
@@ -618,21 +897,124 @@ function ReviewMarkItem({
   );
 }
 
-export default function Home() {
+function EditorTabs({
+  slot,
+  pane,
+  documents,
+  onOpen,
+  onClose,
+  onAdd,
+  onDownload,
+}: {
+  slot: Slot;
+  pane: PaneTabs;
+  documents: EditorItem[];
+  onOpen: (id: string) => void;
+  onClose: (id: string) => void;
+  onAdd: () => void;
+  onDownload: () => void;
+}) {
+  return (
+    <div
+      className="editor-tabs"
+      onDragOver={(event) => {
+        if (event.dataTransfer.types.includes("application/x-comparex-document")) event.preventDefault();
+      }}
+      onDrop={(event) => {
+        const id = event.dataTransfer.getData("application/x-comparex-document");
+        if (!id) return;
+        event.preventDefault();
+        onOpen(id);
+      }}
+    >
+      <span className="editor-group-name">{slot === "left" ? "Editor 1" : "Editor 2"}</span>
+      <div className="editor-tab-list" role="tablist" aria-label={`${slot} editor documents`}>
+        {pane.openIds.map((id) => {
+          const document = documents.find((item) => item.id === id);
+          if (!document) return null;
+          return (
+            <div className={`editor-tab ${pane.activeId === id ? "active" : ""}`} key={id}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={pane.activeId === id}
+                title={document.name}
+                onClick={() => onOpen(id)}
+              >
+                {document.kind === "review-table" ? <Table2 size={14} aria-hidden="true" /> : <FileText size={14} aria-hidden="true" />}
+                <span>{document.name}</span>
+              </button>
+              <button type="button" className="editor-tab-close" onClick={() => onClose(id)} aria-label={`Close ${document.name} in ${slot} editor`}>
+                <X size={13} aria-hidden="true" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <button type="button" className="editor-add" onClick={onAdd} aria-label={`Add PDF to ${slot} editor`} title="Add PDF">
+        <Plus size={16} aria-hidden="true" />
+      </button>
+      <button type="button" className="editor-add" onClick={onDownload} disabled={!pane.activeId || documents.find((item) => item.id === pane.activeId)?.kind !== "pdf"} aria-label={`Download annotated PDF from ${slot} editor`} title="Download annotated PDF">
+        <Download size={15} aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+function ReviewWorkspace({
+  workspaceId,
+  initialName,
+  workspaces,
+  onWorkspaceSaved,
+  onOpenWorkspace,
+  onNewWorkspace,
+  onCloseWorkspace,
+  onDeleteWorkspace,
+}: {
+  workspaceId: string;
+  initialName: string;
+  workspaces: WorkspaceIndex["items"];
+  onWorkspaceSaved: (id: string, name: string, savedAt: string) => void;
+  onOpenWorkspace: (id: string) => void;
+  onNewWorkspace: () => void;
+  onCloseWorkspace: () => void;
+  onDeleteWorkspace: (id: string) => void;
+}) {
   const [files, setFiles] = useState<Record<Slot, UploadedFile | null>>({
     left: null,
     right: null,
   });
-  const [workspaceName, setWorkspaceName] = useState("Untitled workspace");
+  const [workspaceName, setWorkspaceName] = useState(initialName);
   const [leftWidth, setLeftWidth] = useState(50);
   const [requirementStartPath, setRequirementStartPath] = useState("1");
   const [isResizing, setIsResizing] = useState(false);
   const [catalogFiles, setCatalogFiles] = useState<UploadedFile[]>([]);
-  const [isCatalogMenuOpen, setIsCatalogMenuOpen] = useState(false);
+  const [documentStatuses, setDocumentStatuses] = useState<Record<string, { status: "opening" | "ready" | "error"; message?: string }>>({});
+  const [documents, setDocuments] = useState<WorkspaceDocument[]>([]);
+  const [reviewTableName, setReviewTableName] = useState("Review Table");
+  const tableId = reviewTableId(workspaceId);
+  const [tabs, setTabs] = useState<WorkspaceTabs>(() => initialWorkspaceTabs(workspaceId));
+  const [documentViews, setDocumentViews] = useState<Record<string, DocumentView>>({});
+  const [activePane, setActivePane] = useState<Slot>("left");
+  const [isExplorerOpen, setIsExplorerOpen] = useState(true);
+  const [explorerWidth, setExplorerWidth] = useState(300);
+  const [isResizingExplorer, setIsResizingExplorer] = useState(false);
+  const [openExplorerMenuId, setOpenExplorerMenuId] = useState<string | null>(null);
+  const [renamingDocumentId, setRenamingDocumentId] = useState<string | null>(null);
+  const [renamingDocumentValue, setRenamingDocumentValue] = useState("");
+  const [focusTableMarkId, setFocusTableMarkId] = useState<string | null>(null);
+  const [focusEvidenceMarkId, setFocusEvidenceMarkId] = useState<string | null>(null);
+  const [activeEvidenceRowId, setActiveEvidenceRowId] = useState<string | null>(null);
+  const [autoAdvanceEvidence, setAutoAdvanceEvidence] = useState(false);
+  const [autoAdvanceNotice, setAutoAdvanceNotice] = useState("");
+  const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false);
+  const [isRenamingWorkspace, setIsRenamingWorkspace] = useState(false);
   const [isDownloadingEvidence, setIsDownloadingEvidence] = useState(false);
   const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
   const [isClearingProject, setIsClearingProject] = useState(false);
   const [marks, setMarks] = useState<EvidenceMark[]>([]);
+  const [links, setLinks] = useState<WorkspaceLink[]>([]);
+  const [pendingLinkSourceId, setPendingLinkSourceId] = useState<string | null>(null);
   const [catalogLabelOffset, setCatalogLabelOffset] = useState<{
     x: number;
     y: number;
@@ -645,6 +1027,7 @@ export default function Home() {
   const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("all");
   const [dragOverTorId, setDragOverTorId] = useState<string | null>(null);
   const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
+  const [pendingJumpSlot, setPendingJumpSlot] = useState<Slot | null>(null);
   const [interactionMode, setInteractionMode] = useState<"highlight" | "link">("highlight");
   const [collapsedRequirements, setCollapsedRequirements] = useState<Set<string>>(
     new Set(),
@@ -653,9 +1036,8 @@ export default function Home() {
     parentId: string | null;
     value: string;
   } | null>(null);
-  const [storedFileHint, setStoredFileHint] =
-    useState<PersistedWorkspaceState["files"] | null>(null);
   const [hasRestoredWorkspace, setHasRestoredWorkspace] = useState(false);
+  const [fatalRestoreError, setFatalRestoreError] = useState("");
   const [isRestoringFiles, setIsRestoringFiles] = useState(false);
   const [restoreMessage, setRestoreMessage] = useState("");
   const sessionFilesRef = useRef<{
@@ -663,84 +1045,126 @@ export default function Home() {
     catalogs: UploadedFile[];
   }>({ tor: null, catalogs: [] });
   const workspaceRef = useRef<HTMLElement>(null);
+  const workbenchBodyRef = useRef<HTMLDivElement>(null);
   const clearDialogRef = useRef<HTMLDialogElement>(null);
   const skipNextPersistRef = useRef(false);
-  const catalogMenuRef = useRef<HTMLDetailsElement>(null);
-  const catalogPickerRef = useRef<HTMLInputElement>(null);
+  const explorerPickerRef = useRef<HTMLInputElement>(null);
+  const reattachTargetRef = useRef<WorkspaceDocument | null>(null);
+  const replaceTargetRef = useRef<WorkspaceDocument | null>(null);
+  const pickerSlotRef = useRef<Slot>("left");
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
+  const renameOriginalRef = useRef("");
+  const cancelDocumentRenameRef = useRef(false);
+
+  useEffect(() => {
+    if (!activeEvidenceRowId) return;
+    const tableIsVisible = tabs.left.activeId === tableId || tabs.right.activeId === tableId;
+    const rowExists = marks.some((mark) =>
+      mark.id === activeEvidenceRowId && mark.reviewRole !== "highlight" && !mark.referenceOnly,
+    );
+    if (!tableIsVisible || !rowExists) {
+      setActiveEvidenceRowId(null);
+      setAutoAdvanceEvidence(false);
+      setAutoAdvanceNotice("");
+    }
+  }, [activeEvidenceRowId, marks, tableId, tabs.left.activeId, tabs.right.activeId]);
+
+  const recordDocumentStatus = useCallback((
+    id: string,
+    status: "opening" | "ready" | "error",
+    pageCount?: number,
+    message?: string,
+  ) => {
+    setDocumentStatuses((current) => {
+      const previous = current[id];
+      return previous?.status === status && previous?.message === message
+        ? current
+        : { ...current, [id]: { status, message } };
+    });
+    if (status === "ready" && pageCount) {
+      setDocuments((current) => current.some((entry) => entry.id === id && entry.pageCount !== pageCount)
+        ? current.map((entry) => entry.id === id ? { ...entry, pageCount } : entry)
+        : current,
+      );
+    }
+  }, []);
 
   const restoreFilesFromHandles = async (
-    fileHint: PersistedWorkspaceState["files"] | null,
+    entries: WorkspaceDocument[],
+    nextTabs: WorkspaceTabs,
+    isCancelled: () => boolean = () => false,
   ): Promise<RestoreFilesResult> => {
-    if (!fileHint) return { attempted: 0, restored: 0 };
-
-    const torHandle = await readFileHandle("tor");
-    const torFile = torHandle
-      ? await getReadableFileFromHandle(torHandle)
-      : null;
-    const restoredCatalogs = await Promise.all(
-      (fileHint.evidenceNames ?? []).map(async (name) => {
-        const record = await readFileHandle(`catalog:${name}`);
+    const available: UploadedFile[] = [];
+    const verifiedDetails = new Map<string, { size: number; sha256: string }>();
+    for (const entry of entries) {
+      if (isCancelled()) break;
+      const alreadyOpen = catalogFiles.find((item) => item.id === entry.id);
+      if (alreadyOpen) {
+        available.push(alreadyOpen);
+        continue;
+      }
+      try {
+        const record = await readFileHandle(entry.handleKey);
         const file = record ? await getReadableFileFromHandle(record) : null;
-        return file ? { file, url: URL.createObjectURL(file) } : null;
+        if (!file || !isPdfFile(file) || file.size > 100 * 1024 * 1024 ||
+          new TextDecoder().decode(await file.slice(0, 5).arrayBuffer()) !== "%PDF-") continue;
+        const sha256 = await sha256File(file);
+        if (entry.sha256 && sha256 !== entry.sha256) continue;
+        verifiedDetails.set(entry.id, { size: file.size, sha256 });
+        available.push({ id: entry.id, file, url: URL.createObjectURL(file) });
+      } catch {
+        // Keep the document and its marks visible as unresolved in Explorer.
+      }
+    }
+    if (isCancelled()) {
+      available.forEach((item) => URL.revokeObjectURL(item.url));
+      return { attempted: entries.length, restored: 0 };
+    }
+    if (verifiedDetails.size) setDocuments((current) => current.map((entry) => {
+      const details = verifiedDetails.get(entry.id);
+      return details ? { ...entry, ...details } : entry;
+    }));
+    setCatalogFiles((current) => [
+      ...current.filter((item) => !available.some((restoredItem) => restoredItem.id === item.id)),
+      ...available,
+    ]);
+    setFiles((current) => ({
+      left: available.find((item) => item.id === nextTabs.left.activeId) ?? current.left,
+      right: available.find((item) => item.id === nextTabs.right.activeId) ?? current.right,
+    }));
+    setMarks((current) =>
+      current.map((mark) => {
+        const item = available.find((candidate) =>
+          mark.documentId
+            ? candidate.id === mark.documentId
+            : candidate.file.name === mark.fileName,
+        );
+        return item ? { ...mark, documentId: item.id, fileUrl: item.url } : mark;
       }),
     );
-    const catalogs = restoredCatalogs.filter(
-      (item): item is UploadedFile => Boolean(item),
-    );
+    return { attempted: entries.length, restored: available.length };
+  };
 
-    if (torFile) {
-      const url = URL.createObjectURL(torFile);
-      setFiles((current) => ({
-        ...current,
-        left: { file: torFile, url },
-      }));
-      setMarks((current) =>
-        current.map((mark) =>
-          mark.side === "tor" && mark.fileName === torFile.name
-            ? { ...mark, fileUrl: url }
-            : mark,
-        ),
-      );
+  const legacyDocuments = (state: PersistedWorkspaceState) => {
+    const entries: WorkspaceDocument[] = [];
+    const torName = state.files?.torName;
+    if (torName) entries.push({
+      id: crypto.randomUUID(), name: torName, sourceName: torName, size: null, handleKey: "tor",
+    });
+    for (const name of state.files?.evidenceNames ?? []) {
+      entries.push({
+        id: crypto.randomUUID(), name, sourceName: name, size: null, handleKey: `catalog:${name}`,
+      });
     }
-
-    if (catalogs.length) {
-      const active =
-        catalogs.find((item) => item.file.name === fileHint.activeEvidenceName) ??
-        catalogs[0];
-      setCatalogFiles(catalogs);
-      setFiles((current) => ({
-        ...current,
-        right: active,
-      }));
-      setMarks((current) =>
-        current.map((mark) => {
-          if (mark.side !== "catalog") return mark;
-          const match = catalogs.find((item) => item.file.name === mark.fileName);
-          return match ? { ...mark, fileUrl: match.url } : mark;
-        }),
-      );
-    }
-
-    if (torFile || catalogs.length) {
-      setStoredFileHint((current) => ({
-        torName: torFile?.name ?? current?.torName ?? fileHint.torName,
-        activeEvidenceName:
-          catalogs.find((item) => item.file.name === fileHint.activeEvidenceName)
-            ?.file.name ??
-          current?.activeEvidenceName ??
-          fileHint.activeEvidenceName,
-        evidenceNames: Array.from(
-          new Set([
-            ...(current?.evidenceNames ?? fileHint.evidenceNames),
-            ...catalogs.map((item) => item.file.name),
-          ]),
-        ),
-      }));
-    }
-
+    const leftId = entries.find((item) => item.handleKey === "tor")?.id ?? null;
+    const rightId = entries.find((item) => item.name === state.files?.activeEvidenceName)?.id
+      ?? entries.find((item) => item.handleKey.startsWith("catalog:"))?.id ?? null;
     return {
-      attempted: Number(Boolean(fileHint.torName)) + (fileHint.evidenceNames ?? []).length,
-      restored: Number(Boolean(torFile)) + catalogs.length,
+      entries,
+      nextTabs: {
+        left: { openIds: leftId ? [leftId] : [], activeId: leftId },
+        right: { openIds: rightId ? [rightId] : [], activeId: rightId },
+      } satisfies WorkspaceTabs,
     };
   };
 
@@ -748,7 +1172,7 @@ export default function Home() {
     setIsRestoringFiles(true);
     setRestoreMessage("Restoring file access...");
     try {
-      const result = await restoreFilesFromHandles(storedFileHint);
+      const result = await restoreFilesFromHandles(documents, tabs);
       if (!result.attempted) {
         setRestoreMessage("No saved file references to restore.");
       } else if (result.restored) {
@@ -765,20 +1189,19 @@ export default function Home() {
     }
   };
 
-  const openCatalogPicker = async () => {
+  const openCatalogPicker = async (target?: WorkspaceDocument, slot: Slot = activePane, replace = false) => {
+    pickerSlotRef.current = slot;
+    setActivePane(slot);
+    reattachTargetRef.current = null;
+    replaceTargetRef.current = null;
     if (typeof window.showOpenFilePicker === "function") {
       try {
         const handles = await window.showOpenFilePicker({
-          multiple: true,
+          multiple: !target,
           types: [
             {
-              description: "PDF and Word documents",
-              accept: {
-                "application/pdf": [".pdf"],
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [
-                  ".docx",
-                ],
-              },
+              description: "PDF documents",
+              accept: { "application/pdf": [".pdf"] },
             },
           ],
         });
@@ -788,7 +1211,9 @@ export default function Home() {
             handle,
           })),
         );
-        addCatalogFiles(documents.filter(({ file }) => isAcceptedFile(file)));
+        if (target && documents[0] && replace) void replaceDocument(target, documents[0]);
+        else if (target && documents[0]) void reattachDocument(target, documents[0]);
+        else void addDocuments(documents, slot);
         return;
       } catch (pickerError) {
         if (
@@ -800,25 +1225,62 @@ export default function Home() {
       }
     }
 
-    catalogPickerRef.current?.click();
+    reattachTargetRef.current = target ?? null;
+    replaceTargetRef.current = replace && target ? target : null;
+    explorerPickerRef.current?.click();
   };
 
   useEffect(() => {
+    let cancelled = false;
     const restoreWorkspace = async () => {
-      const restored = readPersistedWorkspace();
+      let restored: PersistedWorkspaceState | null;
+      try {
+        restored = readPersistedWorkspace(workspaceId);
+      } catch (error) {
+        setFatalRestoreError(getErrorMessage(error));
+        return;
+      }
       if (!restored) {
         setHasRestoredWorkspace(true);
         return;
       }
 
+      const restoredDocuments = restored.documents?.length || restored.version === 2
+        ? {
+            entries: restored.documents ?? [],
+            nextTabs: restored.tabs ?? emptyWorkspaceTabs(),
+          }
+        : legacyDocuments(restored);
+      const nextTabs = restoreReviewTableTabs(
+        restoredDocuments.nextTabs,
+        workspaceId,
+        restored.version === 1 || restored.panel?.reviewView === "rows",
+      );
+      setReviewTableName(typeof restored.reviewTable?.name === "string"
+        ? sanitizeWorkspaceName(restored.reviewTable.name) || "Review Table"
+        : "Review Table");
+      setDocuments(restoredDocuments.entries);
+      setTabs(nextTabs);
+      setDocumentViews(restored.panel?.documentViews ?? {});
+
       setWorkspaceName(
         sanitizeWorkspaceName(restored.workspaceName ?? "") ||
           "Untitled workspace",
       );
-      setMarks(sanitizeMarksForStorage(restored.marks ?? []));
+      setMarks(sanitizeMarksForStorage(restored.marks ?? []).map((mark) => {
+        if (mark.documentId || mark.manual) return mark;
+        const entry = restoredDocuments.entries.find((item) =>
+          item.name === mark.fileName &&
+          (restored.version === 2 ||
+            (mark.side === "tor" ? item.handleKey === "tor" : item.handleKey.startsWith("catalog:"))),
+        );
+        return entry ? { ...mark, documentId: entry.id, reviewRole: mark.side === "tor" ? "requirement" : undefined } : mark;
+      }));
+      setLinks(restored.links ?? []);
       setLeftWidth(
         Math.min(80, Math.max(20, Number(restored.panel?.leftWidth) || 50)),
       );
+      setExplorerWidth(Math.min(440, Math.max(240, Number(restored.panel?.explorerWidth) || 300)));
       setRequirementStartPath(
         normalizeRequirementStartPath(
           restored.panel?.requirementStartPath ??
@@ -839,14 +1301,24 @@ export default function Home() {
             : [],
         ),
       );
-      setStoredFileHint(restored.files);
-      await restoreFilesFromHandles(restored.files);
+      const result = await restoreFilesFromHandles(
+        restoredDocuments.entries,
+        nextTabs,
+        () => cancelled,
+      );
+      if (cancelled) return;
+      if (result.restored < result.attempted) {
+        setRestoreMessage(
+          `${result.attempted - result.restored} document${result.attempted - result.restored === 1 ? " needs" : "s need"} file access. Select the PDF again in Explorer.`,
+        );
+      }
 
       setHasRestoredWorkspace(true);
     };
 
     void restoreWorkspace();
-  }, []);
+    return () => { cancelled = true; };
+  }, [workspaceId]);
 
   useEffect(() => {
     if (!hasRestoredWorkspace) return;
@@ -855,11 +1327,16 @@ export default function Home() {
       return;
     }
 
-    writePersistedWorkspace({
-      version: 1,
-      savedAt: new Date().toISOString(),
+    const savedAt = new Date().toISOString();
+    const didSave = writePersistedWorkspace(workspaceId, {
+      version: 2,
+      savedAt,
       workspaceName: sanitizeWorkspaceName(workspaceName),
       marks: sanitizeMarksForStorage(marks),
+      links,
+      documents,
+      reviewTable: { id: tableId, name: reviewTableName, kind: "review-table" },
+      tabs,
       panel: {
         leftWidth,
         requirementStartPath,
@@ -868,29 +1345,29 @@ export default function Home() {
         showTorPane,
         showEvidencePane,
         reviewFilter,
+        reviewView: "highlights",
         interactionMode,
+        documentViews,
+        explorerWidth,
       },
       catalogLabelOffset,
       collapsedRequirementIds: Array.from(collapsedRequirements),
       files: {
-        torName: files.left?.file.name ?? storedFileHint?.torName ?? null,
-        activeEvidenceName:
-          files.right?.file.name ?? storedFileHint?.activeEvidenceName ?? null,
-        evidenceNames: Array.from(
-          new Set([
-            ...(storedFileHint?.evidenceNames ?? []),
-            ...catalogFiles.map((item) => item.file.name),
-            ...marks
-              .filter((mark) => mark.side === "catalog")
-              .map((mark) => mark.fileName),
-          ]),
-        ),
+        torName: documents.find((item) => item.id === tabs.left.activeId)?.sourceName ?? null,
+        activeEvidenceName: documents.find((item) => item.id === tabs.right.activeId)?.sourceName ?? null,
+        evidenceNames: documents.map((item) => item.sourceName),
       },
     });
+    if (didSave) onWorkspaceSaved(workspaceId, workspaceName, savedAt);
+    else setRestoreMessage("Could not save this workspace in browser storage.");
   }, [
     catalogFiles,
     catalogLabelOffset,
     collapsedRequirements,
+    documents,
+    reviewTableName,
+    documentViews,
+    explorerWidth,
     files.left,
     files.right,
     hasRestoredWorkspace,
@@ -900,10 +1377,12 @@ export default function Home() {
     showTorPane,
     showEvidencePane,
     leftWidth,
+    links,
     marks,
     requirementStartPath,
     reviewFilter,
-    storedFileHint,
+    tabs,
+    workspaceId,
     workspaceName,
   ]);
 
@@ -913,6 +1392,40 @@ export default function Home() {
     if (isClearConfirmOpen && !dialog.open) dialog.showModal();
     if (!isClearConfirmOpen && dialog.open) dialog.close();
   }, [isClearConfirmOpen]);
+
+  useEffect(() => {
+    if (!isWorkspaceMenuOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsWorkspaceMenuOpen(false);
+    };
+    const closeOutside = (event: globalThis.PointerEvent) => {
+      if (!workspaceMenuRef.current?.contains(event.target as Node)) setIsWorkspaceMenuOpen(false);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("pointerdown", closeOutside);
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("pointerdown", closeOutside);
+    };
+  }, [isWorkspaceMenuOpen]);
+
+  useEffect(() => {
+    if (!openExplorerMenuId) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenExplorerMenuId(null);
+    };
+    const closeOutside = (event: globalThis.PointerEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest("[data-explorer-actions]")) {
+        setOpenExplorerMenuId(null);
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("pointerdown", closeOutside);
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("pointerdown", closeOutside);
+    };
+  }, [openExplorerMenuId]);
 
   useEffect(() => {
     sessionFilesRef.current = { tor: files.left, catalogs: catalogFiles };
@@ -927,200 +1440,271 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!isCatalogMenuOpen) return;
-
-    const closeMenu = (event: globalThis.PointerEvent) => {
-      if (!catalogMenuRef.current?.contains(event.target as Node)) {
-        setIsCatalogMenuOpen(false);
-      }
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setIsCatalogMenuOpen(false);
-    };
-
-    document.addEventListener("pointerdown", closeMenu);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeMenu);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [isCatalogMenuOpen]);
-
-  useEffect(() => {
-    if (!pendingJumpId) return;
+    if (!pendingJumpId || !pendingJumpSlot) return;
 
     const jumpWhenReady = (event: Event) => {
-      if ((event as CustomEvent<string>).detail !== pendingJumpId) return;
+      const detail = (event as CustomEvent<string | { id: string; side: "tor" | "catalog" }>).detail;
+      const targetSide = pendingJumpSlot === "left" ? "tor" : "catalog";
+      if (typeof detail === "string" ? detail !== pendingJumpId :
+        detail.id !== pendingJumpId || detail.side !== targetSide) return;
       window.dispatchEvent(
-        new CustomEvent("comparex:jump-to-mark", { detail: pendingJumpId }),
+        new CustomEvent("comparex:jump-to-mark", { detail: { id: pendingJumpId, side: targetSide } }),
       );
       setPendingJumpId(null);
+      setPendingJumpSlot(null);
     };
     window.addEventListener("comparex:mark-ready", jumpWhenReady);
     return () => window.removeEventListener("comparex:mark-ready", jumpWhenReady);
-  }, [pendingJumpId]);
+  }, [pendingJumpId, pendingJumpSlot]);
 
-  const setFileForSlot = (slot: Slot, document: SelectedDocument) => {
-    const { file, handle } = document;
-    const url = URL.createObjectURL(file);
-    setFiles((current) => {
-      if (current[slot]) URL.revokeObjectURL(current[slot].url);
-
-      return {
-        ...current,
-        [slot]: {
-          file,
-          url,
-        },
-      };
-    });
-    setMarks((current) =>
-      current.map((mark) =>
-        mark.side === (slot === "left" ? "tor" : "catalog") &&
-        mark.fileName === file.name
-          ? { ...mark, fileUrl: url }
-          : mark,
-      ),
-    );
-    void saveFileHandle(slot === "left" ? "tor" : `catalog:${file.name}`, file.name, handle);
-    setStoredFileHint((current) => ({
-      torName: slot === "left" ? file.name : (current?.torName ?? null),
-      activeEvidenceName:
-        slot === "right" ? file.name : (current?.activeEvidenceName ?? null),
-      evidenceNames:
-        slot === "right"
-          ? Array.from(new Set([...(current?.evidenceNames ?? []), file.name]))
-          : (current?.evidenceNames ?? []),
-    }));
+  const openDocument = (slot: Slot, documentId: string) => {
+    const item = catalogFiles.find((candidate) => candidate.id === documentId) ?? null;
+    setActivePane(slot);
+    setTabs((current) => openWorkspaceTab(current, slot, documentId));
+    setFiles((current) => ({ ...current, [slot]: item }));
+    if (!item && documentId !== tableId) setRestoreMessage("This document needs file access. Select it again in Explorer.");
   };
 
-  const clearFileForSlot = (slot: Slot) => {
-    const currentRightName = files.right?.file.name;
-    setFiles((current) => {
-      if (current[slot]) URL.revokeObjectURL(current[slot].url);
-
-      return {
-        ...current,
-        [slot]: null,
-      };
-    });
-    setStoredFileHint((current) =>
-      current
-        ? {
-            torName: slot === "left" ? null : current.torName,
-            activeEvidenceName:
-              slot === "right" && current.activeEvidenceName === currentRightName
-                ? null
-                : current.activeEvidenceName,
-            evidenceNames:
-              slot === "right" && currentRightName
-                ? current.evidenceNames.filter((name) => name !== currentRightName)
-                : current.evidenceNames,
-          }
-        : current,
-    );
-    void deleteFileHandle(slot === "left" ? "tor" : `catalog:${currentRightName ?? ""}`);
+  const openReviewTable = (slot: Slot = activePane) => openDocument(slot, tableId);
+  const revealReviewTable = (markId?: string) => {
+    if (markId) setFocusTableMarkId(markId);
+    openReviewTable(tabs.left.activeId === tableId ? "left" : tabs.right.activeId === tableId ? "right" : "right");
   };
 
-  const addCatalogFiles = (selectedDocuments: SelectedDocument[]) => {
-    const additions = selectedDocuments.map(({ file }) => ({
-      file,
-      url: URL.createObjectURL(file),
-    }));
-    if (!additions.length) return;
+  const updateDocumentView = (slot: Slot, documentId: string, view: DocumentView) => {
+    const key = `${slot}:${documentId}`;
+    setDocumentViews((current) => current[key]?.page === view.page && current[key]?.scale === view.scale
+      ? current
+      : { ...current, [key]: view },
+    );
+  };
 
-    setCatalogFiles((current) => [...current, ...additions]);
+  const closeDocumentTab = (slot: Slot, documentId: string) => {
+    const nextId = closeWorkspaceTab(tabs, slot, documentId)[slot].activeId;
+    setTabs((current) => closeWorkspaceTab(current, slot, documentId));
     setFiles((current) => ({
       ...current,
-      right: additions[0],
-    }));
-    setMarks((current) =>
-      current.map((mark) => {
-        if (mark.side !== "catalog") return mark;
-        const matchingFile = additions.find(
-          (item) => item.file.name === mark.fileName,
-        );
-        return matchingFile ? { ...mark, fileUrl: matchingFile.url } : mark;
-      }),
-    );
-    selectedDocuments.forEach(({ file, handle }) => {
-      void saveFileHandle(`catalog:${file.name}`, file.name, handle);
-    });
-    setStoredFileHint((current) => ({
-      torName: current?.torName ?? null,
-      activeEvidenceName: additions[0].file.name,
-      evidenceNames: Array.from(
-        new Set([
-          ...(current?.evidenceNames ?? []),
-          ...additions.map((item) => item.file.name),
-        ]),
-      ),
+      [slot]: catalogFiles.find((item) => item.id === nextId) ?? null,
     }));
   };
 
-  const removeCatalogFile = (item: UploadedFile) => {
-    if (!window.confirm(`Remove “${item.file.name}” from Product Evidence?`)) {
+  const addDocuments = async (selected: SelectedDocument[], slot: Slot) => {
+    const accepted: Array<{ entry: WorkspaceDocument; item: UploadedFile; handle?: FileSystemFileHandle }> = [];
+    let rejected = 0;
+    if (selected.length) setRestoreMessage("Validating PDF documents...");
+    for (const { file, handle } of selected) {
+      const signature = new TextDecoder().decode(await file.slice(0, 5).arrayBuffer());
+      if (!isPdfFile(file) || signature !== "%PDF-" || file.size > 100 * 1024 * 1024) {
+        rejected += 1;
+        continue;
+      }
+      let sha256: string;
+      try {
+        sha256 = await sha256File(file);
+      } catch {
+        rejected += 1;
+        continue;
+      }
+      const id = crypto.randomUUID();
+      accepted.push({
+        entry: {
+          id, name: file.name, sourceName: file.name, size: file.size, sha256,
+          handleKey: workspaceHandleKey(workspaceId, id),
+        },
+        item: { id, file, url: URL.createObjectURL(file) },
+        handle,
+      });
+    }
+    setRestoreMessage(rejected
+      ? `${rejected} file${rejected === 1 ? " was" : "s were"} not added. Use readable PDFs up to 100 MB.`
+      : "");
+    if (!accepted.length) return;
+    const additions = accepted.map(({ item }) => item);
+    setDocuments((current) => [...current, ...accepted.map(({ entry }) => entry)]);
+    setCatalogFiles((current) => [...current, ...additions]);
+    setDocumentStatuses((current) => ({
+      ...current,
+      ...Object.fromEntries(additions.map((item) => [item.id, { status: "opening" as const }])),
+    }));
+    setTabs((current) => openWorkspaceTab(current, slot, additions[0].id));
+    setFiles((current) => ({ ...current, [slot]: additions[0] }));
+    setActivePane(slot);
+    accepted.forEach(({ entry, handle }) => {
+      void saveFileHandle(entry.handleKey, entry.name, handle);
+    });
+  };
+
+  const reattachDocument = async (entry: WorkspaceDocument, selected: SelectedDocument) => {
+    const { file, handle } = selected;
+    const signature = new TextDecoder().decode(await file.slice(0, 5).arrayBuffer());
+    if (!isPdfFile(file) || signature !== "%PDF-" || file.size > 100 * 1024 * 1024) {
+      setRestoreMessage("Select a readable PDF up to 100 MB.");
       return;
     }
-
-    const index = catalogFiles.findIndex((catalog) => catalog.url === item.url);
-    const nextCatalogs = catalogFiles.filter(
-      (catalog) => catalog.url !== item.url,
-    );
-    setCatalogFiles(nextCatalogs);
+    let sha256: string;
+    try {
+      sha256 = await sha256File(file);
+    } catch {
+      setRestoreMessage("Could not verify this PDF. Try selecting it again.");
+      return;
+    }
+    if (entry.sha256 && sha256 !== entry.sha256) {
+      setRestoreMessage("This PDF differs from the original. Its saved highlights were not attached.");
+      return;
+    }
+    if (!entry.sha256 && (file.name !== (entry.sourceName || entry.name) ||
+      (entry.size !== null && file.size !== entry.size))) {
+      setRestoreMessage("This file does not match the saved document name and size.");
+      return;
+    }
+    if (entry.size === null && !window.confirm(
+      `The original file details for “${entry.name}” were not saved. Confirm this is the same PDF before restoring its highlights.`,
+    )) return;
+    const previous = catalogFiles.find((item) => item.id === entry.id);
+    if (previous) URL.revokeObjectURL(previous.url);
+    const item = { id: entry.id, file, url: URL.createObjectURL(file) };
+    setCatalogFiles((current) => [...current.filter((candidate) => candidate.id !== entry.id), item]);
+    setDocumentStatuses((current) => ({ ...current, [entry.id]: { status: "opening" } }));
+    setDocuments((current) => current.map((candidate) =>
+      candidate.id === entry.id ? { ...candidate, size: file.size, sha256 } : candidate,
+    ));
     setFiles((current) => ({
-      ...current,
-      right:
-        current.right?.url === item.url
-          ? (nextCatalogs[Math.min(index, nextCatalogs.length - 1)] ?? null)
-          : current.right,
+      left: tabs.left.activeId === entry.id ? item : current.left,
+      right: tabs.right.activeId === entry.id ? item : current.right,
     }));
-    URL.revokeObjectURL(item.url);
-    void deleteFileHandle(`catalog:${item.file.name}`);
-    setStoredFileHint((current) =>
-      current
-        ? {
-            ...current,
-            activeEvidenceName:
-              current.activeEvidenceName === item.file.name
-                ? (nextCatalogs[0]?.file.name ?? null)
-                : current.activeEvidenceName,
-            evidenceNames: current.evidenceNames.filter(
-              (name) => name !== item.file.name,
-            ),
-          }
-        : current,
-    );
+    setMarks((current) => current.map((mark) =>
+      mark.documentId === entry.id ? { ...mark, fileUrl: item.url } : mark,
+    ));
+    if (handle) void saveFileHandle(entry.handleKey, entry.sourceName || entry.name, handle);
+    else void deleteFileHandle(entry.handleKey);
+    setRestoreMessage(handle
+      ? `Restored access to ${entry.name}.`
+      : `Opened ${entry.name} for this session. Reopen it after a reload if requested.`);
+  };
+
+  const replaceDocument = async (entry: WorkspaceDocument, selected: SelectedDocument) => {
+    const { file, handle } = selected;
+    const signature = new TextDecoder().decode(await file.slice(0, 5).arrayBuffer());
+    if (!isPdfFile(file) || signature !== "%PDF-" || file.size > 100 * 1024 * 1024) {
+      setRestoreMessage("Select a readable PDF up to 100 MB.");
+      return;
+    }
+    let sha256: string;
+    try { sha256 = await sha256File(file); }
+    catch { setRestoreMessage("Could not verify this PDF."); return; }
+    if (entry.sha256 && entry.sha256 === sha256) {
+      void reattachDocument(entry, selected);
+      return;
+    }
+    if (!window.confirm(
+      `Replace “${entry.name}”? Its saved highlights and their links will be removed because page locations may change.`,
+    )) return;
+    const removedMarkIds = new Set(marks.filter((mark) => mark.documentId === entry.id).map((mark) => mark.id));
+    setMarks((current) => current.filter((mark) => mark.documentId !== entry.id));
+    setLinks((current) => removeWorkspaceLinksForItems(current, removedMarkIds));
+    if (pendingLinkSourceId && removedMarkIds.has(pendingLinkSourceId)) setPendingLinkSourceId(null);
+    const previous = catalogFiles.find((item) => item.id === entry.id);
+    if (previous) URL.revokeObjectURL(previous.url);
+    const item = { id: entry.id, file, url: URL.createObjectURL(file) };
+    setCatalogFiles((current) => [...current.filter((candidate) => candidate.id !== entry.id), item]);
+    setDocuments((current) => current.map((candidate) => candidate.id === entry.id
+      ? { ...candidate, name: file.name, sourceName: file.name, size: file.size, sha256, pageCount: undefined }
+      : candidate,
+    ));
+    setDocumentStatuses((current) => ({ ...current, [entry.id]: { status: "opening" } }));
+    setFiles((current) => ({
+      left: tabs.left.activeId === entry.id ? item : current.left,
+      right: tabs.right.activeId === entry.id ? item : current.right,
+    }));
+    if (handle) void saveFileHandle(entry.handleKey, file.name, handle);
+    else void deleteFileHandle(entry.handleKey);
+    setRestoreMessage(handle
+      ? `Replaced ${entry.name}. Its previous highlights were removed.`
+      : `Replaced ${entry.name} for this session. Reopen the PDF after a reload if requested.`);
+  };
+
+  const selectForWorkspaceLink = (itemId: string) => {
+    if (pendingLinkSourceId && pendingLinkSourceId !== itemId) {
+      setLinks((current) => addWorkspaceLink(current, pendingLinkSourceId, itemId, () => crypto.randomUUID()));
+      setPendingLinkSourceId(null);
+      setInteractionMode("highlight");
+    } else {
+      setPendingLinkSourceId(itemId);
+      setInteractionMode("link");
+      setIsReviewOpen(true);
+    }
+  };
+
+  const removeDocument = (entry: WorkspaceDocument) => {
+    if (!window.confirm(`Remove “${entry.name}” and its highlights from this workspace?`)) return;
+    const loaded = catalogFiles.find((item) => item.id === entry.id);
+    if (loaded) URL.revokeObjectURL(loaded.url);
+    setDocuments((current) => current.filter((item) => item.id !== entry.id));
+    setDocumentViews((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.endsWith(`:${entry.id}`))));
+    setCatalogFiles((current) => current.filter((item) => item.id !== entry.id));
+    setDocumentStatuses((current) => {
+      const next = { ...current };
+      delete next[entry.id];
+      return next;
+    });
+    setMarks((current) => current.filter((mark) => mark.documentId !== entry.id));
+    const removedMarkIds = new Set(marks.filter((mark) => mark.documentId === entry.id).map((mark) => mark.id));
+    if (pendingLinkSourceId && removedMarkIds.has(pendingLinkSourceId)) setPendingLinkSourceId(null);
+    setLinks((current) => removeWorkspaceLinksForItems(current, removedMarkIds));
+    const nextTabs = removeWorkspaceDocumentTabs(tabs, entry.id);
+    setTabs(nextTabs);
+    setFiles({
+      left: catalogFiles.find((item) => item.id === nextTabs.left.activeId && item.id !== entry.id) ?? null,
+      right: catalogFiles.find((item) => item.id === nextTabs.right.activeId && item.id !== entry.id) ?? null,
+    });
+    void deleteFileHandle(entry.handleKey);
   };
 
   const createEvidenceMark = (
     mark: EvidenceMark,
     intent: "highlight" | "link",
   ) => {
+    const sourceFile = catalogFiles.find((item) => item.url === mark.fileUrl);
+    const sourcedMark: EvidenceMark = {
+      ...mark,
+      documentId: sourceFile?.id,
+      reviewRole: "highlight",
+      linkId: undefined,
+    };
     const markWithLabelDefault =
       mark.side === "catalog" && catalogLabelOffset
-        ? { ...mark, labelOffset: catalogLabelOffset }
-        : mark;
-    if (intent === "link" && mark.side === "tor") {
-      if (mark.linkId) {
-        // A manually created requirement already owns this link. Keep the
-        // later TOR selection as its source reference, not a new requirement.
-        setMarks((current) => [
-          ...current,
-          { ...markWithLabelDefault, referenceOnly: true },
-        ]);
-        return;
-      }
-      const linkId = crypto.randomUUID();
-      setMarks((current) => [...current, { ...markWithLabelDefault, linkId }]);
-      setPendingLinkId(linkId);
-      setInteractionMode("link");
-      return;
-    }
-
+        ? { ...sourcedMark, labelOffset: catalogLabelOffset }
+        : sourcedMark;
     setMarks((current) => [...current, markWithLabelDefault]);
-    if (intent === "link" && mark.side === "catalog" && pendingLinkId) {
-      setPendingLinkId(null);
+    if (
+      intent === "highlight" &&
+      interactionMode === "highlight" &&
+      activeEvidenceRowId &&
+      (tabs.left.activeId === tableId || tabs.right.activeId === tableId) &&
+      marks.some((item) => item.id === activeEvidenceRowId && item.reviewRole !== "highlight" && !item.referenceOnly)
+    ) {
+      setLinks((current) => addWorkspaceLink(current, activeEvidenceRowId, mark.id, () => crypto.randomUUID()));
+      if (autoAdvanceEvidence) {
+        const nextId = nextRequirementRowId(gridRows, activeEvidenceRowId);
+        if (nextId) {
+          setActiveEvidenceRowId(nextId);
+          setFocusEvidenceMarkId(nextId);
+          setAutoAdvanceNotice("");
+        } else {
+          setAutoAdvanceEvidence(false);
+          setAutoAdvanceNotice("Last requirement reached. Auto next stopped.");
+        }
+      }
+    }
+    if (intent === "link") {
+      if (pendingLinkSourceId && pendingLinkSourceId !== mark.id) {
+        setLinks((current) => addWorkspaceLink(current, pendingLinkSourceId, mark.id, () => crypto.randomUUID()));
+        setPendingLinkSourceId(null);
+        setInteractionMode("highlight");
+      } else {
+        setPendingLinkSourceId(mark.id);
+        setInteractionMode("link");
+      }
     }
   };
 
@@ -1132,6 +1716,8 @@ export default function Home() {
           item.parentId === mark.id ? { ...item, parentId: undefined } : item,
         ),
     );
+    setLinks((current) => removeWorkspaceLinksForItems(current, new Set([mark.id])));
+    if (pendingLinkSourceId === mark.id) setPendingLinkSourceId(null);
     if (pendingLinkId && mark.linkId === pendingLinkId) {
       setPendingLinkId(null);
     }
@@ -1159,6 +1745,8 @@ export default function Home() {
             : item,
         ),
     );
+    setLinks((current) => removeWorkspaceLinksForItems(current, ids));
+    if (pendingLinkSourceId && ids.has(pendingLinkSourceId)) setPendingLinkSourceId(null);
     requirements.forEach((item) => {
       window.dispatchEvent(
         new CustomEvent("comparex:remove-mark", { detail: item.id }),
@@ -1366,7 +1954,11 @@ export default function Home() {
     setPendingLinkId(null);
   };
 
-  const unlinkEvidenceMark = (mark: EvidenceMark) => {
+  const unlinkEvidenceMark = (mark: EvidenceMark, requirement?: EvidenceMark) => {
+    if (requirement) {
+      setLinks((current) => removeWorkspaceLinkBetween(current, requirement.id, mark.id));
+      if (!mark.linkId || mark.linkId !== requirement.linkId) return;
+    }
     if (!mark.linkId) return;
     const linkId = mark.linkId;
     setMarks((current) => {
@@ -1395,19 +1987,10 @@ export default function Home() {
 
   const linkDroppedEvidence = (torMark: EvidenceMark, evidenceId: string) => {
     const evidenceMark = marks.find(
-      (mark) => mark.id === evidenceId && mark.side === "catalog",
+      (mark) => mark.id === evidenceId && !mark.manual && mark.id !== torMark.id,
     );
     if (!evidenceMark) return;
-
-    const linkId = torMark.linkId ?? crypto.randomUUID();
-    setMarks((current) =>
-      current.map((mark) => {
-        if (mark.id === torMark.id || mark.id === evidenceMark.id) {
-          return { ...mark, linkId };
-        }
-        return mark;
-      }),
-    );
+    setLinks((current) => addWorkspaceLink(current, torMark.id, evidenceMark.id, () => crypto.randomUUID()));
     setPendingLinkId(null);
     setDragOverTorId(null);
   };
@@ -1423,27 +2006,31 @@ export default function Home() {
 
   const jumpToEvidenceMark = (mark: EvidenceMark) => {
     if (mark.manual) return;
-    if (mark.side === "tor") {
-      window.dispatchEvent(
-        new CustomEvent("comparex:jump-to-mark", { detail: mark.id }),
-      );
-      return;
-    }
-
     const targetFile = catalogFiles.find(
       (item) =>
+        (mark.documentId && item.id === mark.documentId) ||
         (mark.fileUrl && item.url === mark.fileUrl) ||
         item.file.name === mark.fileName,
     );
-    if (!targetFile || files.right?.url === targetFile.url) {
+    const tableSlot: Slot | null = tabs.left.activeId === tableId
+      ? "left"
+      : tabs.right.activeId === tableId ? "right" : null;
+    const slot: Slot = tableSlot === "left" ? "right" : tableSlot === "right" ? "left" :
+      mark.side === "tor" ? "left" : "right";
+    if (!targetFile) {
+      setRestoreMessage(`Select ${mark.fileName} again to open this highlight.`);
+      return;
+    }
+    if (files[slot]?.id === targetFile.id) {
       window.dispatchEvent(
-        new CustomEvent("comparex:jump-to-mark", { detail: mark.id }),
+        new CustomEvent("comparex:jump-to-mark", { detail: { id: mark.id, side: slot === "left" ? "tor" : "catalog" } }),
       );
       return;
     }
 
     setPendingJumpId(mark.id);
-    setFiles((current) => ({ ...current, right: targetFile }));
+    setPendingJumpSlot(slot);
+    openDocument(slot, targetFile.id);
   };
 
   const linkGroups = marks.reduce((groups, mark) => {
@@ -1454,25 +2041,19 @@ export default function Home() {
   const pairedLinkIds = new Set(
     Array.from(linkGroups).filter(([, count]) => count > 1).map(([id]) => id),
   );
-  const catalogMarks = marks.filter((mark) => mark.side === "catalog");
-  const highlightCount = catalogMarks.length;
-  const linkedCount = catalogMarks.filter(
-    (mark) =>
-      Boolean(mark.linkId && pairedLinkIds.has(mark.linkId)),
-  ).length;
+  const allHighlights = marks.filter((mark) => !mark.manual && !mark.referenceOnly);
+  const highlightCount = allHighlights.length;
+  const isMarkLinked = (mark: EvidenceMark) =>
+    Boolean(mark.linkId && pairedLinkIds.has(mark.linkId)) ||
+    links.some((link) => link.sourceId === mark.id || link.targetId === mark.id);
+  const linkedCount = allHighlights.filter(isMarkLinked).length;
   const torMarks = marks.filter(
-    (mark) => mark.side === "tor" && !mark.referenceOnly,
+    (mark) => mark.side === "tor" && mark.reviewRole !== "highlight" && !mark.referenceOnly,
   );
-  const unlinkedCatalogMarks = catalogMarks.filter(
-    (mark) => !mark.linkId || !pairedLinkIds.has(mark.linkId),
-  );
-  const unlinkedCount = unlinkedCatalogMarks.length;
-  const visibleTorMarks = torMarks.filter((mark) => {
-    const isPaired = Boolean(mark.linkId && pairedLinkIds.has(mark.linkId));
-    if (reviewFilter === "linked") return isPaired;
-    if (reviewFilter === "unlinked") return !isPaired;
-    return true;
-  });
+  const tableRowIds = new Set(torMarks.map((mark) => mark.id));
+  const unlinkedCatalogMarks = unassignedTableHighlights(allHighlights, tableRowIds, pairedLinkIds, links);
+  const unlinkedCount = highlightCount - linkedCount;
+  const visibleTorMarks = torMarks;
   const visibleTorIds = new Set(visibleTorMarks.map((mark) => mark.id));
   const rootRequirements = torMarks.filter(
     (mark) => !mark.parentId || !torMarks.some((item) => item.id === mark.parentId),
@@ -1535,37 +2116,44 @@ export default function Home() {
       });
     }
   }
-  const showUnlinkedEvidence = reviewFilter !== "linked";
+  const requirementNumbersByMarkId = useMemo(() => requirementNumbersByEvidenceMark(
+    marks,
+    allRequirementRows.map(({ mark, path }) => ({
+      mark,
+      number: mark.requirementNo?.trim() || path,
+    })),
+    links,
+  ), [marks, links, requirementStartPath]);
   const gridRows: RequirementGridRow[] = [
     ...requirementRows.map(({ mark, path, depth }) => ({
       kind: "requirement" as const,
       mark,
       path,
       depth,
-      evidence: marks.filter(
-        (item) =>
-          item.side === "catalog" &&
-          Boolean(mark.linkId) &&
-          item.linkId === mark.linkId,
-      ),
+      evidence: tableEvidenceForRow(marks, mark, links),
     })),
-    ...(showUnlinkedEvidence
-      ? unlinkedCatalogMarks.map((mark) => ({
-          kind: "unassigned" as const,
-          mark,
-          path: "" as const,
-          depth: 0 as const,
-          evidence: [],
-        }))
-      : []),
+    ...unlinkedCatalogMarks.map((mark) => ({
+      kind: "unassigned" as const,
+      mark,
+      path: "" as const,
+      depth: 0 as const,
+      evidence: [],
+    })),
   ];
+  const activeEvidenceRow = gridRows.find((row) =>
+    row.kind === "requirement" && row.mark.id === activeEvidenceRowId,
+  );
+  const directEvidenceTargetId = interactionMode === "highlight" && activeEvidenceRow &&
+    (tabs.left.activeId === tableId || tabs.right.activeId === tableId)
+    ? activeEvidenceRow.mark.id
+    : null;
 
   const getPrintableEvidenceAnnotations = (evidenceFile: UploadedFile) =>
     marks.flatMap<PdfAnnotation>((mark) => {
       if (
-        mark.side !== "catalog" ||
-        (mark.fileUrl && mark.fileUrl !== evidenceFile.url) ||
-        (!mark.fileUrl && mark.fileName !== evidenceFile.file.name)
+        mark.manual ||
+        (mark.documentId && mark.documentId !== evidenceFile.id) ||
+        (!mark.documentId && mark.fileName !== evidenceFile.file.name)
       ) {
         return [];
       }
@@ -1575,9 +2163,7 @@ export default function Home() {
         ? [{
             mark,
             anchor,
-            requirementNo: mark.linkId
-              ? requirementNumberByLinkId.get(mark.linkId)
-              : undefined,
+            requirementNo: requirementNumbersByMarkId.get(mark.id)?.join(" · #"),
           }]
         : [];
     });
@@ -1667,13 +2253,12 @@ export default function Home() {
     });
   };
 
-  const downloadAnnotatedEvidence = async () => {
-    const evidenceFile = files.right;
+  const downloadAnnotatedEvidence = async (evidenceFile: UploadedFile | null) => {
     if (!evidenceFile || !isPdfFile(evidenceFile.file)) return;
 
     const annotations = getPrintableEvidenceAnnotations(evidenceFile);
     if (!annotations.length) {
-      window.alert("No evidence highlights with a saved position to download.");
+      window.alert("No highlights with a saved position to download.");
       return;
     }
 
@@ -1700,11 +2285,11 @@ export default function Home() {
 
   const downloadAllAnnotatedEvidence = async () => {
     if (!downloadableCatalogFiles.length) {
-      window.alert("No loaded PDF evidence files have downloadable highlights.");
+      window.alert("No loaded PDFs have downloadable highlights.");
       return;
     }
 
-    const outputTitle = getWorkspaceOutputTitle("Product Evidence");
+    const outputTitle = getWorkspaceOutputTitle("Annotated PDFs");
 
     setIsDownloadingEvidence(true);
     try {
@@ -1755,8 +2340,8 @@ export default function Home() {
   const clearProject = async () => {
     setIsClearConfirmOpen(false);
     setIsClearingProject(true);
-    const handlesCleared = await clearFileHandles();
-    const workspaceCleared = handlesCleared && clearPersistedWorkspace();
+    const handlesCleared = await clearFileHandles(documents.map((item) => item.handleKey));
+    const workspaceCleared = handlesCleared && clearPersistedWorkspace(workspaceId);
     if (!workspaceCleared) {
       setIsClearingProject(false);
       setRestoreMessage("Could not clear the saved project. Check browser storage access and try again.");
@@ -1775,12 +2360,20 @@ export default function Home() {
     sessionFilesRef.current = { tor: null, catalogs: [] };
     setFiles({ left: null, right: null });
     setCatalogFiles([]);
+    setDocumentStatuses({});
+    setDocuments([]);
+    setReviewTableName("Review Table");
+    setTabs(initialWorkspaceTabs(workspaceId));
+    setDocumentViews({});
+    setExplorerWidth(300);
+    setOpenExplorerMenuId(null);
     setMarks([]);
+    setLinks([]);
+    setPendingLinkSourceId(null);
     setWorkspaceName("Untitled workspace");
     setLeftWidth(50);
     setRequirementStartPath("1");
     setIsResizing(false);
-    setIsCatalogMenuOpen(false);
     setCatalogLabelOffset(null);
     setPendingLinkId(null);
     setIsReviewOpen(false);
@@ -1790,11 +2383,12 @@ export default function Home() {
     setReviewFilter("all");
     setDragOverTorId(null);
     setPendingJumpId(null);
+    setFocusTableMarkId(null);
     setInteractionMode("highlight");
     setCollapsedRequirements(new Set());
     setRequirementComposer(null);
-    setStoredFileHint(null);
-    setRestoreMessage("Project cleared. Original files remain on your device.");
+    setRestoreMessage("Workspace cleared. Original files remain on your device.");
+    onWorkspaceSaved(workspaceId, "Untitled workspace", new Date().toISOString());
     setIsClearingProject(false);
   };
 
@@ -1975,66 +2569,9 @@ export default function Home() {
     );
   };
 
-  const linkedRequirementOrderByFileName = new Map<
-    string,
-    { order: number; requirementNo: string }
-  >();
-  allRequirementRows.forEach(({ mark, path }, order) => {
-    if (!mark.linkId) return;
-
-    const requirementNo = mark.requirementNo?.trim() || path;
-    marks
-      .filter(
-        (item) => item.side === "catalog" && item.linkId === mark.linkId,
-      )
-      .forEach((item) => {
-        const current = linkedRequirementOrderByFileName.get(item.fileName);
-        if (!current || order < current.order) {
-          linkedRequirementOrderByFileName.set(item.fileName, {
-            order,
-            requirementNo,
-          });
-        }
-      });
-  });
-
-  const baseCatalogFileNames = Array.from(
-    new Set([
-      ...(storedFileHint?.evidenceNames ?? []),
-      ...catalogFiles.map((item) => item.file.name),
-      ...marks
-        .filter((mark) => mark.side === "catalog")
-        .map((mark) => mark.fileName),
-    ]),
+  const downloadableCatalogFiles = catalogFiles.filter((item) =>
+    isPdfFile(item.file) && getPrintableEvidenceAnnotations(item).length > 0,
   );
-  const catalogFileIndexByName = new Map(
-    baseCatalogFileNames.map((fileName, index) => [fileName, index]),
-  );
-  const catalogFileNames = [...baseCatalogFileNames].sort((left, right) => {
-    const leftOrder = linkedRequirementOrderByFileName.get(left);
-    const rightOrder = linkedRequirementOrderByFileName.get(right);
-
-    if (leftOrder && rightOrder) {
-      return (
-        leftOrder.order - rightOrder.order ||
-        (catalogFileIndexByName.get(left) ?? 0) -
-          (catalogFileIndexByName.get(right) ?? 0)
-      );
-    }
-
-    if (leftOrder) return -1;
-    if (rightOrder) return 1;
-
-    return (
-      (catalogFileIndexByName.get(left) ?? 0) -
-      (catalogFileIndexByName.get(right) ?? 0)
-    );
-  });
-  const downloadableCatalogFiles = catalogFileNames.flatMap((fileName) => {
-    const item = catalogFiles.find((catalog) => catalog.file.name === fileName);
-    if (!item || !isPdfFile(item.file)) return [];
-    return getPrintableEvidenceAnnotations(item).length ? [item] : [];
-  });
   const visibleDocumentPaneCount = Number(showTorPane) + Number(showEvidencePane);
   const workspaceVisibilityClass =
     visibleDocumentPaneCount === 0
@@ -2042,6 +2579,113 @@ export default function Home() {
       : visibleDocumentPaneCount === 1
         ? "one-pane"
         : "";
+
+  const reviewTable: ReviewTableItem = { id: tableId, name: reviewTableName, kind: "review-table" };
+  const editorItems: EditorItem[] = [reviewTable, ...documents.map((item) => ({
+    id: item.id,
+    name: item.name,
+    kind: "pdf" as const,
+  }))];
+  const openEditorLabels = (id: string) =>
+    [tabs.left.activeId === id ? "Editor 1" : null, tabs.right.activeId === id ? "Editor 2" : null]
+      .filter(Boolean).join(" and ") || "no editor";
+
+  const renderReviewTable = (slot: Slot) => (
+    <section className="review-table-editor" aria-label={`${reviewTableName} in ${slot === "left" ? "Editor 1" : "Editor 2"}`}>
+      <EditorTabs
+        slot={slot}
+        pane={tabs[slot]}
+        documents={editorItems}
+        onOpen={(id) => openDocument(slot, id)}
+        onClose={(id) => closeDocumentTab(slot, id)}
+        onAdd={() => void openCatalogPicker(undefined, slot)}
+        onDownload={() => undefined}
+      />
+      <div className="review-table-body">
+        <div className="requirement-list-toolbar">
+          <strong>{reviewTableName} <span>· {torMarks.length} rows</span></strong>
+          <label className="requirement-start-control">
+            <span>Start no.</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              pattern="[0-9๐-๙]+(\\.[0-9๐-๙]+)*"
+              value={requirementStartPath}
+              onChange={(event) => setRequirementStartPath(event.target.value)}
+              onBlur={() => setRequirementStartPath((current) => normalizeRequirementStartPath(current))}
+            />
+          </label>
+          <button type="button" onClick={() => setRequirementComposer({ parentId: null, value: "" })}>
+            <Plus size={14} aria-hidden="true" /> Add row
+          </button>
+        </div>
+        {activeEvidenceRow ? (
+          <div className="review-table-hint review-table-evidence-target" role="status">
+            <span><strong>Evidence for row {activeEvidenceRow.path} selected.</strong> {autoAdvanceNotice || "Select text or drag an area in the PDF; it will be highlighted and linked automatically."}</span>
+            <div className="review-table-evidence-actions">
+              <button
+                type="button"
+                className={autoAdvanceEvidence ? "active" : ""}
+                aria-pressed={autoAdvanceEvidence}
+                onClick={() => {
+                  setAutoAdvanceEvidence((current) => !current);
+                  setAutoAdvanceNotice("");
+                }}
+              >
+                Auto next {autoAdvanceEvidence ? "On" : "Off"}
+              </button>
+              <button type="button" onClick={() => {
+                setFocusTableMarkId(activeEvidenceRow.mark.id);
+                setActiveEvidenceRowId(null);
+                setAutoAdvanceEvidence(false);
+                setAutoAdvanceNotice("");
+              }}>Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <p className="review-table-hint">Select a source to open its PDF. Select Evidence to choose a linked highlight or add one from the PDF. In Link mode, select a row to link it with a highlight.</p>
+        )}
+        {requirementComposer ? renderRequirementComposer(requirementComposer.parentId) : null}
+        <RequirementGrid
+          rows={gridRows}
+          showStartHint={!torMarks.length}
+          focusMarkId={focusTableMarkId}
+          onFocusHandled={() => setFocusTableMarkId(null)}
+          focusEvidenceMarkId={focusEvidenceMarkId}
+          onEvidenceFocusHandled={() => setFocusEvidenceMarkId(null)}
+          onJump={jumpToEvidenceMark}
+          onUnlink={unlinkEvidenceMark}
+          onDropEvidence={linkDroppedEvidence}
+          onAddRequirement={(title) => createManualRequirement(title)}
+          onAddRequirements={createManualRequirements}
+          onRenameRequirement={renameRequirement}
+          onRenameRequirementNo={renameRequirementNo}
+          onChangeParent={changeRequirementParent}
+          isLinkMode={interactionMode === "link"}
+          onSelectForLink={(mark) => selectForWorkspaceLink(mark.id)}
+          onEvidenceTargetChange={(mark) => {
+            const nextId = mark?.id ?? null;
+            if (focusEvidenceMarkId && nextId !== focusEvidenceMarkId) return;
+            if (nextId !== activeEvidenceRowId) setAutoAdvanceNotice("");
+            setActiveEvidenceRowId(nextId);
+            if (!mark) setAutoAdvanceEvidence(false);
+          }}
+          onDeleteRequirements={removeRequirements}
+          onRemoveUnassignedEvidence={removeEvidenceMark}
+        />
+      </div>
+    </section>
+  );
+
+  if (fatalRestoreError) {
+    return <main className="workspace-start">
+      <section className="workspace-start-content" role="alert">
+        <h1>Could not open this workspace</h1>
+        <p>{fatalRestoreError}</p>
+        <button type="button" onClick={onCloseWorkspace}>Back to Workspaces</button>
+      </section>
+    </main>;
+  }
 
   return (
     <main className={`app-shell ${isReviewPinned ? "review-pinned" : ""}`}>
@@ -2055,20 +2699,64 @@ export default function Home() {
           />
         </div>
 
-        <label className="workspace-name-control">
-          <span>Project Name</span>
-          <input
-            type="text"
-            value={workspaceName}
-            onChange={(event) => setWorkspaceName(event.target.value)}
-            onBlur={() =>
-              setWorkspaceName((current) =>
-                sanitizeWorkspaceName(current) || "Untitled workspace",
-              )
-            }
-            aria-label="Workspace name"
-          />
-        </label>
+        <button
+          className="explorer-toggle"
+          type="button"
+          onClick={() => setIsExplorerOpen((current) => !current)}
+          aria-expanded={isExplorerOpen}
+          aria-controls="workspace-explorer"
+          title={isExplorerOpen ? "Hide Explorer" : "Show Explorer"}
+        >
+          <FilesIcon size={17} aria-hidden="true" />
+        </button>
+
+        <div className="workspace-switcher" ref={workspaceMenuRef}>
+          {isRenamingWorkspace ? (
+            <input
+              autoFocus
+              aria-label="Workspace name"
+              value={workspaceName}
+              maxLength={80}
+              onChange={(event) => setWorkspaceName(event.target.value)}
+              onBlur={() => {
+                setWorkspaceName((current) => sanitizeWorkspaceName(current) || "Untitled workspace");
+                setIsRenamingWorkspace(false);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+                if (event.key === "Escape") {
+                  setWorkspaceName(renameOriginalRef.current);
+                  setIsRenamingWorkspace(false);
+                }
+              }}
+            />
+          ) : (
+          <button
+            type="button"
+            className="workspace-switcher-button"
+            onClick={() => setIsWorkspaceMenuOpen((current) => !current)}
+            aria-expanded={isWorkspaceMenuOpen}
+            aria-controls="workspace-menu"
+          >
+            <span>{workspaceName}</span><ChevronDown size={14} aria-hidden="true" />
+          </button>
+          )}
+          {isWorkspaceMenuOpen ? (
+            <div id="workspace-menu" className="workspace-menu">
+              <button type="button" onClick={() => { setIsWorkspaceMenuOpen(false); onCloseWorkspace(); }}>Workspaces</button>
+              <button type="button" onClick={() => { setIsWorkspaceMenuOpen(false); onNewWorkspace(); }}>New Workspace...</button>
+              <button type="button" onClick={() => { renameOriginalRef.current = workspaceName; setIsWorkspaceMenuOpen(false); setIsRenamingWorkspace(true); }}>Rename Workspace...</button>
+              <div className="workspace-menu-heading">OPEN RECENT</div>
+              {[...workspaces].sort((a, b) => b.savedAt.localeCompare(a.savedAt)).map((item) => (
+                <button type="button" key={item.id} onClick={() => { setIsWorkspaceMenuOpen(false); onOpenWorkspace(item.id); }}>
+                  {item.name}{item.id === workspaceId ? " · Current" : ""}
+                </button>
+              ))}
+              <div className="workspace-menu-divider" />
+              <button type="button" onClick={() => { setIsWorkspaceMenuOpen(false); onDeleteWorkspace(workspaceId); }}>Delete this Workspace...</button>
+            </div>
+          ) : null}
+        </div>
 
         <nav className="toolbar-actions" aria-label="Workspace tools">
           <div className="interaction-mode" role="group" aria-label="Highlight interaction mode">
@@ -2078,6 +2766,7 @@ export default function Home() {
               onClick={() => {
                 setInteractionMode("highlight");
                 setPendingLinkId(null);
+                setPendingLinkSourceId(null);
               }}
               aria-pressed={interactionMode === "highlight"}
               title="Highlight mode"
@@ -2088,7 +2777,12 @@ export default function Home() {
             <button
               type="button"
               className={interactionMode === "link" ? "active" : ""}
-              onClick={() => setInteractionMode("link")}
+              onClick={() => {
+                setActiveEvidenceRowId(null);
+                setAutoAdvanceEvidence(false);
+                setAutoAdvanceNotice("");
+                setInteractionMode("link");
+              }}
               aria-pressed={interactionMode === "link"}
               title="Link mode"
             >
@@ -2121,10 +2815,10 @@ export default function Home() {
             onClick={() => setShowTorPane((current) => !current)}
             aria-pressed={showTorPane}
             aria-controls="tor-panel"
-            title={showTorPane ? "Hide TOR panel" : "Show TOR panel"}
+            title={showTorPane ? "Hide Editor 1" : "Show Editor 1"}
           >
             <FileText aria-hidden="true" size={17} />
-            <span>TOR</span>
+            <span>Editor 1</span>
           </button>
           <button
             className={`tool-button ${showEvidencePane ? "active-tool" : ""}`}
@@ -2132,10 +2826,10 @@ export default function Home() {
             onClick={() => setShowEvidencePane((current) => !current)}
             aria-pressed={showEvidencePane}
             aria-controls="evidence-panel"
-            title={showEvidencePane ? "Hide Product Evidence panel" : "Show Product Evidence panel"}
+            title={showEvidencePane ? "Hide Editor 2" : "Show Editor 2"}
           >
             <FilesIcon aria-hidden="true" size={17} />
-            <span>Evidence</span>
+            <span>Editor 2</span>
           </button>
           <span className="toolbar-separator" aria-hidden="true" />
           <button
@@ -2143,7 +2837,7 @@ export default function Home() {
             type="button"
             onClick={() => void downloadAllAnnotatedEvidence()}
             disabled={isDownloadingEvidence || !downloadableCatalogFiles.length}
-            aria-label="Download all annotated Product Evidence PDFs"
+            aria-label="Download all annotated PDFs"
             title="Download all annotated PDFs"
           >
             <Download aria-hidden="true" size={17} />
@@ -2174,6 +2868,11 @@ export default function Home() {
       {restoreMessage ? (
         <div className="restore-file-status" role="status">
           {restoreMessage}
+          {documents.some((entry) => !catalogFiles.some((item) => item.id === entry.id)) ? (
+            <button className="restore-access-button" type="button" onClick={() => void handleRestoreFiles()} disabled={isRestoringFiles}>
+              {isRestoringFiles ? "Restoring..." : "Retry access"}
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={() => setRestoreMessage("")}
@@ -2194,7 +2893,7 @@ export default function Home() {
       >
         <h2 id="clear-project-title">Clear Project?</h2>
         <p id="clear-project-description">
-          This removes the current project’s documents, requirements, highlights,
+          This clears the current workspace’s PDFs, Review Table rows, highlights,
           links, and saved review state from this browser. Original files on your
           device stay where they are. This cannot be undone.
         </p>
@@ -2208,28 +2907,267 @@ export default function Home() {
         </div>
       </dialog>
 
+      <div
+        ref={workbenchBodyRef}
+        className={`workbench-body ${isResizingExplorer ? "resizing-explorer" : ""}`}
+        style={{ "--explorer-width": `${explorerWidth}px` } as React.CSSProperties}
+      >
+      {isExplorerOpen ? (
+        <aside id="workspace-explorer" className="workspace-explorer" aria-label="Workspace Explorer">
+          <div className="explorer-heading">
+            <strong>EXPLORER</strong>
+            <button className="explorer-add" type="button" onClick={() => void openCatalogPicker()} aria-label="Add PDF documents" title="Add PDF documents">
+              <Plus size={15} aria-hidden="true" /><span>Add PDF</span>
+            </button>
+          </div>
+          <div className="explorer-section-title">DOCUMENTS <span>{documents.length + 1}</span></div>
+          <div
+            className="explorer-document-list"
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              event.preventDefault();
+              void getDroppedDocuments(event).then((selected) => addDocuments(selected, activePane));
+            }}
+          >
+            <div
+              className={`explorer-document review-table-item ${tabs[activePane].activeId === tableId ? "active" : ""}`}
+              draggable={renamingDocumentId !== tableId && openExplorerMenuId !== tableId}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "copy";
+                event.dataTransfer.setData("application/x-comparex-document", tableId);
+              }}
+            >
+              <div className="explorer-document-row">
+                {renamingDocumentId === tableId ? (
+                  <input
+                    autoFocus
+                    value={renamingDocumentValue}
+                    aria-label="Rename Review Table"
+                    onChange={(event) => setRenamingDocumentValue(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        cancelDocumentRenameRef.current = true;
+                        setRenamingDocumentId(null);
+                      }
+                      if (event.key === "Enter") event.currentTarget.blur();
+                    }}
+                    onBlur={() => {
+                      if (!cancelDocumentRenameRef.current) {
+                        setReviewTableName(sanitizeWorkspaceName(renamingDocumentValue) || reviewTableName);
+                      }
+                      cancelDocumentRenameRef.current = false;
+                      setRenamingDocumentId(null);
+                    }}
+                  />
+                ) : (
+                  <button type="button" className="explorer-document-main" onClick={() => openReviewTable()} title={`Open ${reviewTableName} in ${activePane === "left" ? "Editor 1" : "Editor 2"}`} aria-label={`Open ${reviewTableName} in ${activePane === "left" ? "Editor 1" : "Editor 2"}. Currently open in ${openEditorLabels(tableId)}.`}>
+                    <Table2 size={17} aria-hidden="true" />
+                    <span><strong>{reviewTableName}</strong><small>Table · {torMarks.length} rows</small></span>
+                    <span className="explorer-pane-badges" aria-hidden="true">
+                      {tabs.left.activeId === tableId ? <b>1</b> : null}
+                      {tabs.right.activeId === tableId ? <b>2</b> : null}
+                    </span>
+                  </button>
+                )}
+                <button
+                  data-explorer-actions
+                  type="button"
+                  className="explorer-more"
+                  aria-label={`More actions for ${reviewTableName}`}
+                  aria-expanded={openExplorerMenuId === tableId}
+                  onClick={() => setOpenExplorerMenuId((current) => current === tableId ? null : tableId)}
+                ><MoreHorizontal size={17} aria-hidden="true" /></button>
+              </div>
+              {openExplorerMenuId === tableId ? <div data-explorer-actions className="explorer-document-menu" aria-label={`Actions for ${reviewTableName}`}>
+                <button type="button" onClick={() => { openReviewTable(activePane === "left" ? "right" : "left"); setOpenExplorerMenuId(null); }}>Open in other editor</button>
+                <button type="button" onClick={() => { cancelDocumentRenameRef.current = false; setRenamingDocumentId(tableId); setRenamingDocumentValue(reviewTableName); setOpenExplorerMenuId(null); }}>Rename</button>
+              </div> : null}
+            </div>
+            {documents.map((entry, index) => {
+              const loaded = catalogFiles.find((item) => item.id === entry.id);
+              const status = documentStatuses[entry.id];
+              return (
+                <div
+                  className={`explorer-document ${tabs[activePane].activeId === entry.id ? "active" : ""}`}
+                  key={entry.id}
+                  draggable={renamingDocumentId !== entry.id && openExplorerMenuId !== entry.id}
+                  onDragStart={(event) => {
+                    event.dataTransfer.effectAllowed = "copy";
+                    event.dataTransfer.setData("application/x-comparex-document", entry.id);
+                  }}
+                >
+                  <div className="explorer-document-row">
+                    {renamingDocumentId === entry.id ? (
+                      <input
+                        autoFocus
+                        value={renamingDocumentValue}
+                        aria-label={`Rename ${entry.name}`}
+                        onChange={(event) => setRenamingDocumentValue(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape") {
+                            cancelDocumentRenameRef.current = true;
+                            setRenamingDocumentId(null);
+                          }
+                          if (event.key === "Enter") event.currentTarget.blur();
+                        }}
+                        onBlur={() => {
+                          const nextName = sanitizeWorkspaceName(renamingDocumentValue);
+                          if (!cancelDocumentRenameRef.current && nextName) setDocuments((current) => current.map((item) =>
+                            item.id === entry.id ? { ...item, name: nextName } : item,
+                          ));
+                          cancelDocumentRenameRef.current = false;
+                          setRenamingDocumentId(null);
+                        }}
+                      />
+                    ) : (
+                      <button type="button" className="explorer-document-main" onClick={() => openDocument(activePane, entry.id)} title={`Open ${entry.name} in ${activePane === "left" ? "Editor 1" : "Editor 2"}`} aria-label={`Open ${entry.name} in ${activePane === "left" ? "Editor 1" : "Editor 2"}. Currently open in ${openEditorLabels(entry.id)}.${loaded ? "" : " File access needed."}`}>
+                        <FileText size={17} aria-hidden="true" />
+                        <span><strong title={entry.name}>{explorerDisplayName(entry.name)}</strong><small className={!loaded ? "needs-access" : ""} title={status?.message}>{loaded
+                          ? status?.status === "error"
+                            ? "Could not render PDF"
+                            : status?.status === "opening"
+                              ? "Opening PDF..."
+                              : `PDF · ${entry.pageCount ? `${entry.pageCount} pages · ` : ""}${formatFileSize(loaded.file.size)}`
+                          : "Needs file access"}</small></span>
+                        <span className="explorer-pane-badges" aria-hidden="true">
+                          {tabs.left.activeId === entry.id ? <b>1</b> : null}
+                          {tabs.right.activeId === entry.id ? <b>2</b> : null}
+                        </span>
+                      </button>
+                    )}
+                    <button
+                      data-explorer-actions
+                      type="button"
+                      className="explorer-more"
+                      aria-label={`More actions for ${entry.name}`}
+                      aria-expanded={openExplorerMenuId === entry.id}
+                      onClick={() => setOpenExplorerMenuId((current) => current === entry.id ? null : entry.id)}
+                    ><MoreHorizontal size={17} aria-hidden="true" /></button>
+                  </div>
+                  {!loaded ? <button type="button" className="explorer-access-button" onClick={() => void openCatalogPicker(entry)}>
+                    <FolderOpen size={13} aria-hidden="true" /> Select original PDF
+                  </button> : null}
+                  {openExplorerMenuId === entry.id ? <div data-explorer-actions className="explorer-document-menu" aria-label={`Actions for ${entry.name}`}>
+                    <button type="button" onClick={() => { openDocument(activePane === "left" ? "right" : "left", entry.id); setOpenExplorerMenuId(null); }}>Open in other editor</button>
+                    <button type="button" onClick={() => { cancelDocumentRenameRef.current = false; setRenamingDocumentId(entry.id); setRenamingDocumentValue(entry.name); setOpenExplorerMenuId(null); }}>Rename</button>
+                    <button type="button" onClick={() => { void openCatalogPicker(entry, activePane, true); setOpenExplorerMenuId(null); }}>Replace PDF</button>
+                    <button type="button" disabled={index === 0} onClick={() => { setDocuments((current) => {
+                      const next = [...current];
+                      [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                      return next;
+                    }); setOpenExplorerMenuId(null); }}>Move up</button>
+                    <button type="button" disabled={index === documents.length - 1} onClick={() => { setDocuments((current) => {
+                      const next = [...current];
+                      [next[index], next[index + 1]] = [next[index + 1], next[index]];
+                      return next;
+                    }); setOpenExplorerMenuId(null); }}>Move down</button>
+                    <button type="button" className="danger" onClick={() => { removeDocument(entry); setOpenExplorerMenuId(null); }}>Remove from workspace</button>
+                  </div> : null}
+                </div>
+              );
+            })}
+            {!documents.length ? <p className="explorer-empty">Drop PDFs here or use + to add documents.</p> : null}
+          </div>
+          <input
+            ref={explorerPickerRef}
+            className="sr-only"
+            type="file"
+            accept=".pdf,application/pdf"
+            multiple
+            onChange={(event) => {
+              const selected = Array.from(event.target.files ?? []).map((file) => ({ file }));
+              const target = reattachTargetRef.current;
+              const replaceTarget = replaceTargetRef.current;
+              reattachTargetRef.current = null;
+              replaceTargetRef.current = null;
+              if (replaceTarget && selected[0]) void replaceDocument(replaceTarget, selected[0]);
+              else if (target && selected[0]) void reattachDocument(target, selected[0]);
+              else void addDocuments(selected, pickerSlotRef.current);
+              event.target.value = "";
+            }}
+          />
+        </aside>
+      ) : null}
+      {isExplorerOpen ? <div
+        className="explorer-resizer"
+        role="separator"
+        aria-label="Resize Explorer"
+        aria-orientation="vertical"
+        aria-valuemin={240}
+        aria-valuemax={440}
+        aria-valuenow={explorerWidth}
+        tabIndex={0}
+        onPointerDown={(event) => {
+          event.currentTarget.setPointerCapture(event.pointerId);
+          setIsResizingExplorer(true);
+        }}
+        onPointerMove={(event) => {
+          if (!isResizingExplorer) return;
+          const left = workbenchBodyRef.current?.getBoundingClientRect().left ?? 0;
+          setExplorerWidth(Math.min(440, Math.max(240, event.clientX - left)));
+        }}
+        onPointerUp={(event) => {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+          setIsResizingExplorer(false);
+        }}
+        onPointerCancel={() => setIsResizingExplorer(false)}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+            event.preventDefault();
+            setExplorerWidth((current) => Math.min(440, Math.max(240, current + (event.key === "ArrowLeft" ? -16 : 16))));
+          }
+        }}
+      /> : null}
       <section
         ref={workspaceRef}
         className={`workspace ${isResizing ? "resizing" : ""} ${workspaceVisibilityClass}`}
         aria-label="Document upload workspace"
         style={{ "--left-panel-width": `${leftWidth}%` } as React.CSSProperties}
       >
-        {showTorPane ? (
+        {showTorPane && tabs.left.activeId === tableId ? renderReviewTable("left") : showTorPane ? (
           <DropPanel
             id="tor-panel"
-            title="TOR / Requirements"
+            title="Editor 1"
             tone="version-a"
             uploadedFile={files.left}
-            onSelect={(documents) => setFileForSlot("left", documents[0])}
-            onClear={() => clearFileForSlot("left")}
+            missingDocument={documents.find((item) => item.id === tabs.left.activeId)?.name}
+            onSelect={(selected) => void addDocuments(selected, "left")}
+            onOpenDocumentDrop={(id) => openDocument("left", id)}
+            toolbar={<EditorTabs
+              slot="left"
+              pane={tabs.left}
+              documents={editorItems}
+              onOpen={(id) => openDocument("left", id)}
+              onClose={(id) => closeDocumentTab("left", id)}
+              onAdd={() => void openCatalogPicker(undefined, "left")}
+              onDownload={() => void downloadAnnotatedEvidence(files.left)}
+            />}
             previewProps={{
               side: "tor",
               pendingLinkId,
               interactionMode,
-              marks: marks.filter(
-                (mark) => mark.side === "tor" && mark.fileName === files.left?.file.name,
+              evidenceTargetRowId: directEvidenceTargetId,
+              neutralLinking: true,
+              onStatusChange: files.left
+                ? (status, pageCount, message) => recordDocumentStatus(files.left!.id, status, pageCount, message)
+                : undefined,
+              initialView: files.left ? documentViews[`left:${files.left.id}`] : undefined,
+              onViewChange: files.left
+                ? (view) => updateDocumentView("left", files.left!.id, view)
+                : undefined,
+              marks: marks.filter((mark) =>
+                mark.documentId
+                  ? mark.documentId === files.left?.id
+                  : mark.fileName === files.left?.file.name,
               ),
+              requirementNumbersByMarkId,
               onCreateMark: createEvidenceMark,
+              onAutoPlaceMark: (id, labelPosition) =>
+                setMarks((current) =>
+                  current.map((mark) =>
+                    mark.id === id && !mark.labelPosition ? { ...mark, labelPosition } : mark,
+                  ),
+                ),
               onMoveMark: (id, labelPosition) =>
                 setMarks((current) =>
                   current.map((mark) =>
@@ -2272,22 +3210,42 @@ export default function Home() {
             <span aria-hidden="true" />
           </div>
         ) : null}
-        {showEvidencePane ? (
+        {showEvidencePane && tabs.right.activeId === tableId ? renderReviewTable("right") : showEvidencePane ? (
           <DropPanel
             id="evidence-panel"
-            title="Product Evidence"
+            title="Editor 2"
             tone="version-b"
             multiple
             uploadedFile={files.right}
-            onSelect={addCatalogFiles}
+            missingDocument={documents.find((item) => item.id === tabs.right.activeId)?.name}
+            onSelect={(selected) => void addDocuments(selected, "right")}
+            onOpenDocumentDrop={(id) => openDocument("right", id)}
             previewProps={{
               side: "catalog",
               pendingLinkId,
               interactionMode,
-              marks: marks.filter(
-                (mark) => mark.side === "catalog" && mark.fileName === files.right?.file.name,
+              evidenceTargetRowId: directEvidenceTargetId,
+              neutralLinking: true,
+              onStatusChange: files.right
+                ? (status, pageCount, message) => recordDocumentStatus(files.right!.id, status, pageCount, message)
+                : undefined,
+              initialView: files.right ? documentViews[`right:${files.right.id}`] : undefined,
+              onViewChange: files.right
+                ? (view) => updateDocumentView("right", files.right!.id, view)
+                : undefined,
+              marks: marks.filter((mark) =>
+                mark.documentId
+                  ? mark.documentId === files.right?.id
+                  : mark.fileName === files.right?.file.name,
               ),
               requirementNumberByLinkId,
+              requirementNumbersByMarkId,
+              onAutoPlaceMark: (id, labelPosition) =>
+                setMarks((current) =>
+                  current.map((mark) =>
+                    mark.id === id && !mark.labelPosition ? { ...mark, labelPosition } : mark,
+                  ),
+                ),
               onMoveMark: (id, labelPosition, labelOffset) => {
                 setCatalogLabelOffset(labelOffset);
                 setMarks((current) =>
@@ -2298,179 +3256,34 @@ export default function Home() {
               },
               onCreateMark: createEvidenceMark,
             }}
-            toolbar={
-            <div className="catalog-toolbar">
-              <div className="catalog-title" title={files.right?.file.name}>
-                <FileText aria-hidden="true" size={15} />
-                <span>{files.right?.file.name ?? "Product Evidence"}</span>
-              </div>
-
-              <details
-                className="catalog-switcher"
-                ref={catalogMenuRef}
-                open={isCatalogMenuOpen}
-                onToggle={(event) =>
-                  setIsCatalogMenuOpen(event.currentTarget.open)
-                }
-              >
-                <summary title="All Product Evidence documents">
-                  <FilesIcon aria-hidden="true" size={15} />
-                  <span>Files {catalogFileNames.length}</span>
-                  <ChevronDown aria-hidden="true" size={14} />
-                </summary>
-                <div className="catalog-popover">
-                  <div className="catalog-popover-heading">
-                    <div>
-                      <strong>Product Evidence</strong>
-                      <span>{catalogFileNames.length} documents</span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setIsCatalogMenuOpen(false)}
-                      aria-label="Close document switcher"
-                    >
-                      <X aria-hidden="true" size={16} />
-                    </button>
-                  </div>
-
-                  <div className="catalog-list">
-                    {catalogFileNames.length ? (
-                      catalogFileNames.map((fileName) => {
-                        const item = catalogFiles.find(
-                          (catalog) => catalog.file.name === fileName,
-                        );
-                        const linkedRequirement =
-                          linkedRequirementOrderByFileName.get(fileName);
-                        const fileStatus = item
-                          ? `${isPdfFile(item.file) ? "PDF" : "DOCX"} · ${formatFileSize(item.file.size)}`
-                          : "Waiting for file permission";
-
-                        return (
-                          <div
-                            className={`catalog-row ${
-                              item && files.right?.url === item.url ? "active" : ""
-                            } ${item ? "" : "pending"}`}
-                            key={item?.url ?? fileName}
-                          >
-                            <button
-                              className="catalog-row-main"
-                              type="button"
-                              onClick={() => {
-                                if (!item) {
-                                  void handleRestoreFiles();
-                                  return;
-                                }
-                                setFiles((current) => ({
-                                  ...current,
-                                  right: item,
-                                }));
-                                setIsCatalogMenuOpen(false);
-                              }}
-                            >
-                              <FileText aria-hidden="true" size={18} />
-                              <span>
-                                <strong>{fileName}</strong>
-                                <small>
-                                  {linkedRequirement
-                                    ? `${fileStatus} · Req ${linkedRequirement.requirementNo}`
-                                    : fileStatus}
-                                </small>
-                              </span>
-                            </button>
-                            {item ? (
-                              <button
-                                className="catalog-row-remove"
-                                type="button"
-                                onClick={() => removeCatalogFile(item)}
-                                aria-label={`Remove ${item.file.name}`}
-                                title="Remove document"
-                              >
-                                <Trash2 aria-hidden="true" size={15} />
-                              </button>
-                            ) : null}
-                          </div>
-                        );
-                      })
-                    ) : (
-                      <p className="catalog-empty">No evidence documents yet</p>
-                    )}
-                  </div>
-
-                  <button
-                    className="catalog-add-button"
-                    type="button"
-                    onClick={() => void openCatalogPicker()}
-                  >
-                    <Plus aria-hidden="true" size={16} />
-                    Add documents
-                  </button>
-                </div>
-              </details>
-
-              <button
-                className="catalog-quick-add"
-                type="button"
-                onClick={() => void openCatalogPicker()}
-                aria-label="Add Product Evidence documents"
-                title="Add documents"
-              >
-                <Plus aria-hidden="true" size={16} />
-              </button>
-              <button
-                className="catalog-download-button"
-                type="button"
-                onClick={() => void downloadAnnotatedEvidence()}
-                disabled={
-                  isDownloadingEvidence ||
-                  !files.right ||
-                  !isPdfFile(files.right.file) ||
-                  !marks.some(
-                    (mark) =>
-                      mark.side === "catalog" &&
-                      ((mark.fileUrl && mark.fileUrl === files.right?.url) ||
-                        (!mark.fileUrl && mark.fileName === files.right?.file.name)) &&
-                      Boolean(mark.linkId && requirementNumberByLinkId.has(mark.linkId)),
-                  )
-                }
-                aria-label="Download annotated Product Evidence PDF"
-                title="Download annotated PDF"
-              >
-                <Download aria-hidden="true" size={16} />
-              </button>
-              <input
-                ref={catalogPickerRef}
-                className="sr-only"
-                type="file"
-                multiple
-                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                onChange={(event) => {
-                  const selected = Array.from(event.target.files ?? []);
-                  const accepted = selected.filter(isAcceptedFile);
-                  if (accepted.length) {
-                    addCatalogFiles(accepted.map((file) => ({ file })));
-                  }
-                  event.target.value = "";
-                }}
-              />
-            </div>
-            }
+            toolbar={<EditorTabs
+              slot="right"
+              pane={tabs.right}
+              documents={editorItems}
+              onOpen={(id) => openDocument("right", id)}
+              onClose={(id) => closeDocumentTab("right", id)}
+              onAdd={() => void openCatalogPicker(undefined, "right")}
+              onDownload={() => void downloadAnnotatedEvidence(files.right)}
+            />}
           />
         ) : null}
         {!showTorPane && !showEvidencePane ? (
           <div className="workspace-empty-state" role="status">
             <strong>No document panes shown</strong>
-            <span>Use the TOR or Evidence buttons in the toolbar to show a pane.</span>
+          <span>Use the Editor 1 or Editor 2 buttons in the toolbar to show a pane.</span>
           </div>
         ) : null}
       </section>
+      </div>
       {interactionMode === "link" ? (
         <div className="link-mode-status" role="status">
           <Link2 aria-hidden="true" size={16} />
-          {pendingLinkId
-            ? "Drag supporting text or area to link"
-            : "Drag a TOR requirement to start linking"}
+          {pendingLinkSourceId
+            ? "Select another highlight or table row to link, or mark a PDF area"
+            : "Select a highlight or mark a PDF area to start a link"}
           <button type="button" onClick={() => {
             setPendingLinkId(null);
+            setPendingLinkSourceId(null);
             setInteractionMode("highlight");
           }}>
             Cancel
@@ -2487,7 +3300,7 @@ export default function Home() {
         <header>
           <div className="review-rail-title">
             <strong>Review highlights</strong>
-            <span>{torMarks.length} requirements · {highlightCount} highlights</span>
+            <span>{documents.length} PDFs · 1 Review Table · {highlightCount} highlights · {links.length} links</span>
           </div>
           <div className="review-rail-actions">
             <button
@@ -2535,56 +3348,46 @@ export default function Home() {
           ))}
         </div>
         <div className="review-list">
-          <div className="requirement-list-toolbar">
-            <strong>Requirements</strong>
-            <label className="requirement-start-control">
-              <span>Start no.</span>
-              <input
-                type="text"
-                inputMode="decimal"
-                pattern="[0-9๐-๙]+(\\.[0-9๐-๙]+)*"
-                value={requirementStartPath}
-                onChange={(event) => {
-                  setRequirementStartPath(event.target.value);
-                }}
-                onBlur={() =>
-                  setRequirementStartPath((current) =>
-                    normalizeRequirementStartPath(current),
-                  )
-                }
-              />
-            </label>
-            <button
-              type="button"
-              onClick={() => setRequirementComposer({ parentId: null, value: "" })}
-            >
-              <Plus aria-hidden="true" size={14} />
-              Add requirement
-            </button>
-          </div>
-          {requirementComposer
-            ? renderRequirementComposer(requirementComposer.parentId)
-            : null}
-          <RequirementGrid
-            rows={gridRows}
-            showStartHint={!marks.length}
-            onJump={jumpToEvidenceMark}
-            onUnlink={unlinkEvidenceMark}
-            onDropEvidence={linkDroppedEvidence}
-            onAddRequirement={(title) => createManualRequirement(title)}
-            onAddRequirements={createManualRequirements}
-            onRenameRequirement={renameRequirement}
-            onRenameRequirementNo={renameRequirementNo}
-            onChangeParent={changeRequirementParent}
-            isLinkMode={interactionMode === "link"}
-            onSelectForLink={linkExistingMark}
-            onDeleteRequirements={removeRequirements}
-            onRemoveUnassignedEvidence={removeEvidenceMark}
-          />
-          {marks.length && !visibleTorMarks.length &&
-          !(showUnlinkedEvidence && unlinkedCatalogMarks.length) ? (
-            <p className="review-empty">No highlights match this filter.</p>
-          ) : null}
+            <div className="workspace-review-content">
+              <div className="workspace-review-heading"><strong>HIGHLIGHTS</strong><span>{highlightCount}</span></div>
+              {allHighlights.filter((mark) => reviewFilter === "all" ||
+                (reviewFilter === "linked" ? isMarkLinked(mark) : !isMarkLinked(mark)),
+              ).map((mark) => {
+                const entry = documents.find((item) => item.id === mark.documentId);
+                const available = catalogFiles.some((item) => item.id === mark.documentId);
+                return (
+                  <div className="workspace-highlight-row" key={mark.id}>
+                    <button type="button" className="workspace-highlight-main" onClick={() => jumpToEvidenceMark(mark)}>
+                      <span>{entry?.name ?? mark.fileName} · Page {mark.page}{available ? "" : " · Source unavailable"}</span>
+                      <strong>{mark.text}</strong>
+                      {mark.note ? <small>{mark.note}</small> : null}
+                    </button>
+                    <div className="workspace-highlight-actions">
+                      <span>{isMarkLinked(mark) ? "Linked" : "Unlinked"}</span>
+                      <button type="button" onClick={() => selectForWorkspaceLink(mark.id)} aria-label={`Link highlight on page ${mark.page}`} title="Link highlight"><Link2 size={15} aria-hidden="true" /></button>
+                      <button type="button" onClick={() => removeEvidenceMark(mark)} aria-label={`Remove highlight on page ${mark.page}`} title="Remove highlight"><Trash2 size={15} aria-hidden="true" /></button>
+                    </div>
+                  </div>
+                );
+              })}
+              {!allHighlights.length ? <p className="review-empty">No highlights yet. Select text or draw an area on a PDF.</p> : null}
+              <div className="workspace-review-heading"><strong>LINKS</strong><span>{links.length}</span></div>
+              {links.map((link) => {
+                const source = marks.find((item) => item.id === link.sourceId);
+                const target = marks.find((item) => item.id === link.targetId);
+                return (
+                  <div className="workspace-link-row" key={link.id}>
+                    <div>
+                      <button type="button" onClick={() => source && (tableRowIds.has(source.id) ? revealReviewTable(source.id) : jumpToEvidenceMark(source))}>{source && tableRowIds.has(source.id) ? `Row: ${source.text}` : source ? `${source.fileName} · p.${source.page}` : "Unresolved source"}</button>
+                      <span aria-hidden="true">↔</span>
+                      <button type="button" onClick={() => target && (tableRowIds.has(target.id) ? revealReviewTable(target.id) : jumpToEvidenceMark(target))}>{target && tableRowIds.has(target.id) ? `Row: ${target.text}` : target ? `${target.fileName} · p.${target.page}` : "Unresolved target"}</button>
+                    </div>
+                    <button type="button" onClick={() => setLinks((current) => current.filter((item) => item.id !== link.id))} aria-label="Remove link" title="Remove link"><Unlink2 size={15} aria-hidden="true" /></button>
+                  </div>
+                );
+              })}
+              {!links.length ? <p className="review-empty">Select Link on two highlights or a table row to connect them.</p> : null}
+            </div>
         </div>
       </aside>
     </main>
