@@ -39,6 +39,8 @@ function annotation(requirementNo) {
 async function withCanvas(callback) {
   const originalDocument = globalThis.document;
   const renderedLabels = [];
+  const paintedBackgrounds = [];
+  const renderedFonts = [];
   globalThis.document = {
     createElement: (tag) => {
       assert.equal(tag, "canvas");
@@ -46,7 +48,9 @@ async function withCanvas(callback) {
         getContext: () => ({
           measureText: () => ({ width: 36 }),
           scale: () => {},
-          fillText: (text) => renderedLabels.push(text),
+          fillRect: (...args) => paintedBackgrounds.push(["fill", ...args]),
+          strokeRect: (...args) => paintedBackgrounds.push(["stroke", ...args]),
+          fillText(text) { renderedLabels.push(text); renderedFonts.push(this.font); },
         }),
         toDataURL: () => transparentPng,
       };
@@ -54,7 +58,7 @@ async function withCanvas(callback) {
   };
 
   try {
-    return await callback(renderedLabels);
+    return await callback(renderedLabels, paintedBackgrounds, renderedFonts);
   } finally {
     if (originalDocument === undefined) delete globalThis.document;
     else globalThis.document = originalDocument;
@@ -79,6 +83,41 @@ test("exports a Thai-numbered annotation without WinAnsi encoding errors", async
       [annotation("๔.๑.๕")],
     );
     assert.deepEqual(renderedLabels, ["#๔.๑.๕"]);
+    assert.equal((await PDFDocument.load(await output.arrayBuffer())).getPageCount(), 1);
+  });
+});
+
+test("exports a shared highlight with independently colored links", async () => {
+  await withCanvas(async () => {
+    const output = await createAnnotatedPdf(
+      await makeSourceFile(),
+      [{ ...annotation("1 · #2"), colors: ["rose", "teal"] }],
+    );
+    assert.equal((await PDFDocument.load(await output.arrayBuffer())).getPageCount(), 1);
+  });
+});
+
+test("exports placed Thai Requirement text without a background or frame", async () => {
+  await withCanvas(async (renderedText, paintedBackgrounds) => {
+    const output = await createAnnotatedPdf(
+      await makeSourceFile(),
+      [],
+      undefined,
+      [{ id: "stamp", rowId: "row", documentId: "doc", page: 1, x: 0.3, y: 0.4, text: "ลำโพง 12 นิ้ว" }],
+    );
+    assert.deepEqual(renderedText, ["ลำโพง 12 นิ้ว"]);
+    assert.deepEqual(paintedBackgrounds, []);
+    assert.equal((await PDFDocument.load(await output.arrayBuffer())).getPageCount(), 1);
+  });
+});
+
+test("exports a resized Requirement with the stored text size", async () => {
+  await withCanvas(async (_, __, renderedFonts) => {
+    const output = await createAnnotatedPdf(
+      await makeSourceFile(), [], undefined,
+      [{ id: "stamp", rowId: "row", documentId: "doc", page: 1, x: 0.2, y: 0.3, text: "ทดสอบ", scale: 2 }],
+    );
+    assert.ok(Math.abs(Number.parseFloat(renderedFonts[0]) - 13.6) < 0.001);
     assert.equal((await PDFDocument.load(await output.arrayBuffer())).getPageCount(), 1);
   });
 });

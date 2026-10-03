@@ -1,5 +1,7 @@
 import type { PDFDocument, PDFFont, PDFImage, PDFPage } from "pdf-lib";
 import type { EvidenceMark } from "./PdfPreview";
+import { linkColorStyle, resolveLinkColor, type LinkColor } from "./linkColors.mts";
+import { layoutRequirementText, type RequirementTextPlacement } from "./requirementText.mts";
 import {
   annotationLabelFont,
   annotationLabelFontStyle,
@@ -17,6 +19,7 @@ export type PdfAnnotation = {
   mark: EvidenceMark;
   requirementNo?: string;
   anchor: Anchor;
+  colors?: readonly LinkColor[];
 };
 
 async function prepareLabel(
@@ -79,6 +82,10 @@ async function drawAnnotation(
 ) {
   const { rgb } = pdfLib;
   const { mark, requirementNo, anchor } = annotation;
+  const colors = (annotation.colors?.length ? annotation.colors : [resolveLinkColor(mark.color)]).map(linkColorStyle);
+  const primaryColor = colors[0];
+  const pdfColor = (color: typeof primaryColor) => rgb(...color.rgb.map((channel) => channel / 255) as [number, number, number]);
+  const badgeColor = rgb(...([1, 3, 5].map((index) => Number.parseInt(primaryColor.badge.slice(index, index + 2), 16) / 255) as [number, number, number]));
   const { x: cropX, y: cropY, width, height } = page.getCropBox();
   const highlightRects = mark.area ? [mark.area] : anchor.rects ?? [];
 
@@ -94,21 +101,30 @@ async function drawAnnotation(
       y,
       width: rectWidth,
       height: rectHeight,
-      color: rgb(0.23, 0.51, 0.96),
+      color: pdfColor(primaryColor),
       opacity: isAreaMark ? 0.23 : 0.32,
-      borderColor: isAreaMark ? rgb(0.23, 0.51, 0.96) : undefined,
-      borderWidth: isAreaMark ? 1.2 : undefined,
-      borderDashArray: isAreaMark ? [3, 2] : undefined,
     });
-
-    if (!isAreaMark) {
-      page.drawLine({
-        start: { x, y },
-        end: { x: x + rectWidth, y },
-        thickness: 1.2,
-        color: rgb(0.23, 0.51, 0.96),
-      });
-    }
+    colors.forEach((color, index) => {
+      if (isAreaMark) {
+        const inset = index * 2;
+        page.drawRectangle({
+          x: x + inset,
+          y: y + inset,
+          width: Math.max(0, rectWidth - inset * 2),
+          height: Math.max(0, rectHeight - inset * 2),
+          borderColor: pdfColor(color),
+          borderWidth: 1.2,
+          borderDashArray: [3, 2],
+        });
+      } else {
+        page.drawLine({
+          start: { x, y: y + index * 2 },
+          end: { x: x + rectWidth, y: y + index * 2 },
+          thickness: 1.2,
+          color: pdfColor(color),
+        });
+      }
+    });
   });
 
   if (!requirementNo) return;
@@ -141,7 +157,7 @@ async function drawAnnotation(
       start: { x: cropX + connector.start.x, y: cropY + height - connector.start.y },
       end: { x: cropX + connector.end.x, y: cropY + height - connector.end.y },
       thickness: Math.max(0.6, width * 0.0014),
-      color: rgb(29 / 255, 78 / 255, 216 / 255),
+      color: badgeColor,
     });
   }
 
@@ -150,7 +166,7 @@ async function drawAnnotation(
     y,
     width: layout.width,
     height: layout.height,
-    color: rgb(29 / 255, 78 / 255, 216 / 255),
+    color: badgeColor,
   });
   if (preparedLabel.kind === "image") {
     page.drawImage(preparedLabel.image, {
@@ -170,11 +186,46 @@ async function drawAnnotation(
   }
 }
 
+async function drawRequirementText(
+  pdf: PDFDocument,
+  page: PDFPage,
+  placement: RequirementTextPlacement,
+) {
+  const { x: cropX, y: cropY, width: pageWidth, height: pageHeight } = page.getCropBox();
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Could not render placed requirement text.");
+  context.font = `${pageWidth * 0.017 * (placement.scale ?? 1)}px Arial, sans-serif`;
+  const layout = layoutRequirementText(
+    placement.text, pageWidth, pageHeight, placement.x, placement.y,
+    (value) => context.measureText(value).width,
+    placement.scale ?? 1,
+  );
+  const ratio = 3;
+  canvas.width = Math.ceil(layout.width * ratio);
+  canvas.height = Math.ceil(layout.height * ratio);
+  context.scale(ratio, ratio);
+  context.fillStyle = "#111827";
+  context.font = `${layout.fontSize}px Arial, sans-serif`;
+  context.textBaseline = "alphabetic";
+  layout.lines.forEach((line, index) => {
+    context.fillText(line, layout.padding, layout.padding + layout.fontSize + index * layout.lineHeight);
+  });
+  const image = await pdf.embedPng(canvas.toDataURL("image/png"));
+  page.drawImage(image, {
+    x: cropX + layout.left,
+    y: cropY + pageHeight - layout.top - layout.height,
+    width: layout.width,
+    height: layout.height,
+  });
+}
+
 async function createDirectAnnotatedPdf(
   file: File,
   annotations: PdfAnnotation[],
   pdfLib: PdfLibModule,
   title?: string,
+  textPlacements: RequirementTextPlacement[] = [],
 ) {
   const { PDFDocument, StandardFonts } = pdfLib;
   const pdf = await PDFDocument.load(await file.arrayBuffer(), {
@@ -191,6 +242,10 @@ async function createDirectAnnotatedPdf(
     if (mark.page < 1 || mark.page > pageCount) continue;
     await drawAnnotation(pdfLib, pdf, pdf.getPage(mark.page - 1), font, labelCache, annotation);
   }
+  for (const placement of textPlacements) {
+    if (placement.page < 1 || placement.page > pageCount) continue;
+    await drawRequirementText(pdf, pdf.getPage(placement.page - 1), placement);
+  }
 
   return new Blob([Uint8Array.from(await pdf.save()).buffer], {
     type: "application/pdf",
@@ -202,6 +257,7 @@ async function createRasterizedAnnotatedPdf(
   annotations: PdfAnnotation[],
   pdfLib: PdfLibModule,
   title?: string,
+  textPlacements: RequirementTextPlacement[] = [],
 ) {
   const pdfjs = await import("pdfjs-dist/legacy/webpack.mjs");
   const { PDFDocument, StandardFonts } = pdfLib;
@@ -219,6 +275,12 @@ async function createRasterizedAnnotatedPdf(
     const pageAnnotations = annotationsByPage.get(annotation.mark.page) ?? [];
     pageAnnotations.push(annotation);
     annotationsByPage.set(annotation.mark.page, pageAnnotations);
+  });
+  const placementsByPage = new Map<number, RequirementTextPlacement[]>();
+  textPlacements.forEach((placement) => {
+    const onPage = placementsByPage.get(placement.page) ?? [];
+    onPage.push(placement);
+    placementsByPage.set(placement.page, onPage);
   });
 
   try {
@@ -264,6 +326,9 @@ async function createRasterizedAnnotatedPdf(
       for (const annotation of annotationsByPage.get(pageNumber) ?? []) {
         await drawAnnotation(pdfLib, outputPdf, outputPage, font, labelCache, annotation);
       }
+      for (const placement of placementsByPage.get(pageNumber) ?? []) {
+        await drawRequirementText(outputPdf, outputPage, placement);
+      }
     }
   } finally {
     await loadingTask.destroy();
@@ -278,14 +343,15 @@ export async function createAnnotatedPdf(
   file: File,
   annotations: PdfAnnotation[],
   title?: string,
+  textPlacements: RequirementTextPlacement[] = [],
 ): Promise<Blob> {
   const pdfLib = await import("pdf-lib");
 
   try {
-    return await createDirectAnnotatedPdf(file, annotations, pdfLib, title);
+    return await createDirectAnnotatedPdf(file, annotations, pdfLib, title, textPlacements);
   } catch (error) {
     try {
-      return await createRasterizedAnnotatedPdf(file, annotations, pdfLib, title);
+      return await createRasterizedAnnotatedPdf(file, annotations, pdfLib, title, textPlacements);
     } catch (fallbackError) {
       const originalMessage =
         error instanceof Error ? error.message : "direct PDF annotation failed";

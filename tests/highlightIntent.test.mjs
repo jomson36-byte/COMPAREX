@@ -10,7 +10,7 @@ const base = {
   evidenceTargetRowId: null,
 };
 
-test("a selected Evidence cell commits a PDF selection without the floating toolbar", () => {
+test("a selected Add link cell commits a PDF selection without the floating toolbar", () => {
   assert.equal(selectionAction({ ...base, evidenceTargetRowId: "row-1" }), "highlight");
   assert.equal(selectionAction({ ...base, pendingLinkId: "older-link", evidenceTargetRowId: "row-1" }), "highlight");
   assert.equal(selectionAction(base), "toolbar");

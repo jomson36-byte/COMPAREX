@@ -4,6 +4,7 @@ import {
   closeWorkspaceTab,
   emptyWorkspaceTabs,
   initialWorkspaceTabs,
+  moveWorkspaceTab,
   openWorkspaceTab,
   removeWorkspaceDocumentTabs,
   restoreReviewTableTabs,
@@ -19,6 +20,24 @@ test("opens the same PDF in both editors independently", () => {
   tabs = closeWorkspaceTab(tabs, "left", "pdf-a");
   assert.equal(tabs.left.activeId, null);
   assert.equal(tabs.right.activeId, "pdf-a");
+});
+
+test("moving a tab activates it in the other pane and restores the source pane", () => {
+  let tabs = openWorkspaceTab(emptyWorkspaceTabs(), "left", "pdf-a");
+  tabs = openWorkspaceTab(tabs, "left", "pdf-b");
+  tabs = openWorkspaceTab(tabs, "right", "review-table");
+  tabs = moveWorkspaceTab(tabs, "left", "right", "pdf-b");
+  assert.deepEqual(tabs.left, { openIds: ["pdf-a"], activeId: "pdf-a" });
+  assert.deepEqual(tabs.right, { openIds: ["review-table", "pdf-b"], activeId: "pdf-b" });
+});
+
+test("moving a tab already open in the target pane keeps a single target tab", () => {
+  let tabs = openWorkspaceTab(emptyWorkspaceTabs(), "left", "pdf-a");
+  tabs = openWorkspaceTab(tabs, "right", "pdf-a");
+  tabs = moveWorkspaceTab(tabs, "left", "right", "pdf-a");
+  assert.deepEqual(tabs.left, { openIds: [], activeId: null });
+  assert.deepEqual(tabs.right, { openIds: ["pdf-a"], activeId: "pdf-a" });
+  assert.equal(moveWorkspaceTab(tabs, "left", "right", "pdf-a"), tabs);
 });
 
 test("switches tabs without duplicating files and restores prior tab when closing", () => {

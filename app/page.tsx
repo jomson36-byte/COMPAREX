@@ -26,6 +26,8 @@ import {
   Highlighter,
   Link2,
   MoreHorizontal,
+  PanelLeft,
+  PanelRight,
   Pin,
   PinOff,
   Plus,
@@ -40,13 +42,6 @@ import type { PdfAnnotation } from "./annotatedPdf.mts";
 import type { EvidenceMark } from "./PdfPreview";
 import type { RequirementGridRow } from "./RequirementGrid";
 import {
-  appendRequirementPath,
-  getParentRequirementNumber,
-  getRootRequirementPath,
-  normalizeRequirementStartPath,
-  toAsciiDigits,
-} from "./requirementNumbering.mts";
-import {
   readWorkspaceIndex,
   saveWorkspaceIndex,
   workspaceHandleKey,
@@ -57,6 +52,7 @@ import {
   closeWorkspaceTab,
   emptyWorkspaceTabs,
   initialWorkspaceTabs,
+  moveWorkspaceTab,
   openWorkspaceTab,
   removeWorkspaceDocumentTabs,
   restoreReviewTableTabs,
@@ -70,8 +66,11 @@ import {
   removeWorkspaceLinksForItems,
   type WorkspaceLink,
 } from "./workspaceLinks.mts";
-import { nextRequirementRowId, requirementNumbersByEvidenceMark, tableEvidenceForRow, unassignedTableHighlights } from "./workspaceTable.mts";
+import { columnLinkColor, resolveLinkColor, sanitizeColumnLinkColors } from "./linkColors.mts";
+import type { LinkColor } from "./linkColors.mts";
+import { colorsByTableColumns, moveTableRows, nextAvailableLinkColumn, nextRequirementRowId, requirementNumbersByEvidenceMark, tableLinkSlotsForRow, unassignedTableHighlights } from "./workspaceTable.mts";
 import { explorerDisplayName } from "./explorerName.mts";
+import { latestRequirementTextPlacement, removeRequirementTextPlacements, sanitizeRequirementTextPlacements, type RequirementTextPlacement } from "./requirementText.mts";
 
 const PdfPreview = dynamic(() => import("./PdfPreview"), {
   ssr: false,
@@ -84,6 +83,15 @@ const RequirementGrid = dynamic(() => import("./RequirementGrid"), {
 });
 
 type Slot = "left" | "right";
+const paneLabel = (slot: Slot) => slot === "left" ? "left pane" : "right pane";
+const WORKSPACE_TAB_DRAG_TYPE = "application/x-comparex-tab";
+const readDraggedWorkspaceTab = (event: DragEvent<HTMLElement>) => {
+  const data = event.dataTransfer.getData(WORKSPACE_TAB_DRAG_TYPE);
+  const separator = data.indexOf(":");
+  const from = data.slice(0, separator);
+  const id = data.slice(separator + 1);
+  return (from === "left" || from === "right") && id ? { from: from as Slot, id } : null;
+};
 type DocumentView = { page: number; scale: number };
 
 type UploadedFile = {
@@ -102,7 +110,7 @@ type WorkspaceDocument = {
   handleKey: string;
 };
 
-type ReviewTableItem = { id: string; name: string; kind: "review-table" };
+type ReviewTableItem = { id: string; name: string; kind: "review-table"; linkColumnCount?: number; linkColumnColors?: Record<string, LinkColor> };
 type EditorItem = { id: string; name: string; kind: "pdf" | "review-table" };
 
 type SelectedDocument = {
@@ -359,11 +367,10 @@ type PersistedWorkspaceState = {
   savedAt: string;
   workspaceName?: string;
   marks: EvidenceMark[];
+  textPlacements?: RequirementTextPlacement[];
   links?: WorkspaceLink[];
   panel: {
     leftWidth: number;
-    requirementStartNumber?: number;
-    requirementStartPath?: string;
     isReviewOpen: boolean;
     isReviewPinned: boolean;
     showTorPane?: boolean;
@@ -593,6 +600,7 @@ function DropPanel({
   multiple = false,
   onSelect,
   onOpenDocumentDrop,
+  onMoveTabDrop,
   onClear,
   toolbar,
   previewProps,
@@ -605,6 +613,7 @@ function DropPanel({
   multiple?: boolean;
   onSelect: (documents: SelectedDocument[]) => void;
   onOpenDocumentDrop?: (documentId: string) => void;
+  onMoveTabDrop?: (from: Slot, documentId: string) => void;
   onClear?: () => void;
   toolbar?: ReactNode;
   previewProps?: {
@@ -619,6 +628,12 @@ function DropPanel({
     onViewChange?: (view: DocumentView) => void;
     requirementNumberByLinkId?: ReadonlyMap<string, string>;
     requirementNumbersByMarkId?: ReadonlyMap<string, readonly string[]>;
+    colorsByMarkId?: ReadonlyMap<string, readonly LinkColor[]>;
+    textPlacements?: RequirementTextPlacement[];
+    textPlacementTarget?: { rowId: string; text: string } | null;
+    onPlaceText?: (page: number, x: number, y: number) => boolean;
+    onMoveTextPlacement?: (id: string, x: number, y: number, scale?: number) => void;
+    onRemoveTextPlacement?: (id: string) => void;
     onCreateMark: (mark: EvidenceMark, intent: "highlight" | "link") => void;
     onMoveMark?: (
       id: string,
@@ -684,6 +699,11 @@ function DropPanel({
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
+    const tab = readDraggedWorkspaceTab(event);
+    if (tab && onMoveTabDrop) {
+      onMoveTabDrop(tab.from, tab.id);
+      return;
+    }
     const documentId = event.dataTransfer.getData("application/x-comparex-document");
     if (documentId && onOpenDocumentDrop) {
       onOpenDocumentDrop(documentId);
@@ -735,20 +755,12 @@ function DropPanel({
         }}
         onDragLeave={() => setIsDragging(false)}
         onDrop={onDrop}
-        role="button"
-        tabIndex={0}
-        onClick={() => void openPicker()}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            void openPicker();
-          }
-        }}
       >
         <input
           ref={inputRef}
           className="sr-only"
           type="file"
+          tabIndex={-1}
           multiple={multiple}
           accept=".pdf,application/pdf"
           onChange={onInputChange}
@@ -772,6 +784,12 @@ function DropPanel({
               onViewChange={previewProps?.onViewChange}
               requirementNumberByLinkId={previewProps?.requirementNumberByLinkId}
               requirementNumbersByMarkId={previewProps?.requirementNumbersByMarkId}
+              colorsByMarkId={previewProps?.colorsByMarkId}
+              textPlacements={previewProps?.textPlacements}
+              textPlacementTarget={previewProps?.textPlacementTarget}
+              onPlaceText={previewProps?.onPlaceText}
+              onMoveTextPlacement={previewProps?.onMoveTextPlacement}
+              onRemoveTextPlacement={previewProps?.onRemoveTextPlacement}
               onCreateMark={previewProps?.onCreateMark ?? (() => undefined)}
               onMoveMark={previewProps?.onMoveMark}
               onAutoPlaceMark={previewProps?.onAutoPlaceMark}
@@ -797,11 +815,17 @@ function DropPanel({
           </div>
         ) : (
           <div className="empty-state">
-            <div className="upload-mark" aria-hidden="true">
-              +
-            </div>
-            <strong>Drag & Drop file here</strong>
-            <span>หรือคลิกเพื่อเลือกไฟล์จากเครื่อง</span>
+            <strong>Drag & Drop PDF here</strong>
+            <span>ลากไฟล์มาวางได้ทั่วช่องนี้ หรือ</span>
+            <button
+              className="upload-select-button"
+              type="button"
+              onClick={() => void openPicker()}
+              aria-label={`เลือก PDF ใน ${title}`}
+            >
+              <Plus size={17} aria-hidden="true" />
+              เลือก PDF
+            </button>
           </div>
         )}
       </div>
@@ -903,6 +927,7 @@ function EditorTabs({
   documents,
   onOpen,
   onClose,
+  onMove,
   onAdd,
   onDownload,
 }: {
@@ -911,24 +936,44 @@ function EditorTabs({
   documents: EditorItem[];
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
+  onMove: (from: Slot, id: string) => void;
   onAdd: () => void;
   onDownload: () => void;
 }) {
+  const [isTabDropTarget, setIsTabDropTarget] = useState(false);
   return (
     <div
-      className="editor-tabs"
+      className={`editor-tabs ${isTabDropTarget ? "tab-drop-target" : ""}`}
       onDragOver={(event) => {
-        if (event.dataTransfer.types.includes("application/x-comparex-document")) event.preventDefault();
+        if (event.dataTransfer.types.includes(WORKSPACE_TAB_DRAG_TYPE)) {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+          setIsTabDropTarget(true);
+        } else if (event.dataTransfer.types.includes("application/x-comparex-document")) {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "copy";
+        }
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setIsTabDropTarget(false);
       }}
       onDrop={(event) => {
+        const tab = readDraggedWorkspaceTab(event);
+        if (tab) {
+          event.preventDefault();
+          event.stopPropagation();
+          setIsTabDropTarget(false);
+          onMove(tab.from, tab.id);
+          return;
+        }
         const id = event.dataTransfer.getData("application/x-comparex-document");
         if (!id) return;
         event.preventDefault();
+        event.stopPropagation();
         onOpen(id);
       }}
     >
-      <span className="editor-group-name">{slot === "left" ? "Editor 1" : "Editor 2"}</span>
-      <div className="editor-tab-list" role="tablist" aria-label={`${slot} editor documents`}>
+      <div className="editor-tab-list" role="tablist" aria-label={`${paneLabel(slot)} documents`}>
         {pane.openIds.map((id) => {
           const document = documents.find((item) => item.id === id);
           if (!document) return null;
@@ -938,23 +983,36 @@ function EditorTabs({
                 type="button"
                 role="tab"
                 aria-selected={pane.activeId === id}
-                title={document.name}
+                aria-keyshortcuts={slot === "left" ? "Alt+Shift+ArrowRight" : "Alt+Shift+ArrowLeft"}
+                title={`${document.name} · drag to the other pane or press Alt+Shift+${slot === "left" ? "Right" : "Left"}`}
                 onClick={() => onOpen(id)}
+                draggable
+                onDragStart={(event) => {
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData(WORKSPACE_TAB_DRAG_TYPE, `${slot}:${id}`);
+                }}
+                onKeyDown={(event) => {
+                  const direction = slot === "left" ? "ArrowRight" : "ArrowLeft";
+                  if (event.altKey && event.shiftKey && event.key === direction) {
+                    event.preventDefault();
+                    onMove(slot, id);
+                  }
+                }}
               >
                 {document.kind === "review-table" ? <Table2 size={14} aria-hidden="true" /> : <FileText size={14} aria-hidden="true" />}
                 <span>{document.name}</span>
               </button>
-              <button type="button" className="editor-tab-close" onClick={() => onClose(id)} aria-label={`Close ${document.name} in ${slot} editor`}>
+              <button type="button" className="editor-tab-close" onClick={() => onClose(id)} aria-label={`Close ${document.name} in ${paneLabel(slot)}`}>
                 <X size={13} aria-hidden="true" />
               </button>
             </div>
           );
         })}
       </div>
-      <button type="button" className="editor-add" onClick={onAdd} aria-label={`Add PDF to ${slot} editor`} title="Add PDF">
+      <button type="button" className="editor-add" onClick={onAdd} aria-label={`Add PDF to ${paneLabel(slot)}`} title="Add PDF">
         <Plus size={16} aria-hidden="true" />
       </button>
-      <button type="button" className="editor-add" onClick={onDownload} disabled={!pane.activeId || documents.find((item) => item.id === pane.activeId)?.kind !== "pdf"} aria-label={`Download annotated PDF from ${slot} editor`} title="Download annotated PDF">
+      <button type="button" className="editor-add" onClick={onDownload} disabled={!pane.activeId || documents.find((item) => item.id === pane.activeId)?.kind !== "pdf"} aria-label={`Download annotated PDF from ${paneLabel(slot)}`} title="Download annotated PDF">
         <Download size={15} aria-hidden="true" />
       </button>
     </div>
@@ -986,12 +1044,13 @@ function ReviewWorkspace({
   });
   const [workspaceName, setWorkspaceName] = useState(initialName);
   const [leftWidth, setLeftWidth] = useState(50);
-  const [requirementStartPath, setRequirementStartPath] = useState("1");
   const [isResizing, setIsResizing] = useState(false);
   const [catalogFiles, setCatalogFiles] = useState<UploadedFile[]>([]);
   const [documentStatuses, setDocumentStatuses] = useState<Record<string, { status: "opening" | "ready" | "error"; message?: string }>>({});
   const [documents, setDocuments] = useState<WorkspaceDocument[]>([]);
   const [reviewTableName, setReviewTableName] = useState("Review Table");
+  const [linkColumnCount, setLinkColumnCount] = useState(1);
+  const [linkColumnColors, setLinkColumnColors] = useState<Record<string, LinkColor>>({});
   const tableId = reviewTableId(workspaceId);
   const [tabs, setTabs] = useState<WorkspaceTabs>(() => initialWorkspaceTabs(workspaceId));
   const [documentViews, setDocumentViews] = useState<Record<string, DocumentView>>({});
@@ -1005,7 +1064,12 @@ function ReviewWorkspace({
   const [focusTableMarkId, setFocusTableMarkId] = useState<string | null>(null);
   const [focusEvidenceMarkId, setFocusEvidenceMarkId] = useState<string | null>(null);
   const [activeEvidenceRowId, setActiveEvidenceRowId] = useState<string | null>(null);
-  const [autoAdvanceEvidence, setAutoAdvanceEvidence] = useState(false);
+  const [activeTextRowId, setActiveTextRowId] = useState<string | null>(null);
+  const [placedTextMenu, setPlacedTextMenu] = useState<{ rowId: string; left: number; top: number } | null>(null);
+  const placedTextMenuRef = useRef<HTMLDivElement>(null);
+  const placedTextReturnFocusRef = useRef<HTMLElement | null>(null);
+  const [activeLinkColumn, setActiveLinkColumn] = useState<number | null>(null);
+  const [autoAdvanceEvidence, setAutoAdvanceEvidence] = useState(true);
   const [autoAdvanceNotice, setAutoAdvanceNotice] = useState("");
   const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false);
   const [isRenamingWorkspace, setIsRenamingWorkspace] = useState(false);
@@ -1013,6 +1077,7 @@ function ReviewWorkspace({
   const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
   const [isClearingProject, setIsClearingProject] = useState(false);
   const [marks, setMarks] = useState<EvidenceMark[]>([]);
+  const [textPlacements, setTextPlacements] = useState<RequirementTextPlacement[]>([]);
   const [links, setLinks] = useState<WorkspaceLink[]>([]);
   const [pendingLinkSourceId, setPendingLinkSourceId] = useState<string | null>(null);
   const [catalogLabelOffset, setCatalogLabelOffset] = useState<{
@@ -1028,6 +1093,8 @@ function ReviewWorkspace({
   const [dragOverTorId, setDragOverTorId] = useState<string | null>(null);
   const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
   const [pendingJumpSlot, setPendingJumpSlot] = useState<Slot | null>(null);
+  const [pendingPlacementJumpId, setPendingPlacementJumpId] = useState<string | null>(null);
+  const [pendingPlacementJumpSlot, setPendingPlacementJumpSlot] = useState<Slot | null>(null);
   const [interactionMode, setInteractionMode] = useState<"highlight" | "link">("highlight");
   const [collapsedRequirements, setCollapsedRequirements] = useState<Set<string>>(
     new Set(),
@@ -1064,10 +1131,21 @@ function ReviewWorkspace({
     );
     if (!tableIsVisible || !rowExists) {
       setActiveEvidenceRowId(null);
+      setActiveLinkColumn(null);
       setAutoAdvanceEvidence(false);
       setAutoAdvanceNotice("");
     }
   }, [activeEvidenceRowId, marks, tableId, tabs.left.activeId, tabs.right.activeId]);
+
+  useEffect(() => {
+    if (!activeTextRowId) return;
+    const tableIsVisible = tabs.left.activeId === tableId || tabs.right.activeId === tableId;
+    if (!tableIsVisible || !marks.some((mark) => mark.id === activeTextRowId)) setActiveTextRowId(null);
+  }, [activeTextRowId, marks, tableId, tabs.left.activeId, tabs.right.activeId]);
+
+  useEffect(() => {
+    if (interactionMode === "link") setActiveTextRowId(null);
+  }, [interactionMode]);
 
   const recordDocumentStatus = useCallback((
     id: string,
@@ -1259,6 +1337,10 @@ function ReviewWorkspace({
       setReviewTableName(typeof restored.reviewTable?.name === "string"
         ? sanitizeWorkspaceName(restored.reviewTable.name) || "Review Table"
         : "Review Table");
+      const restoredColumnCount = restored.reviewTable?.linkColumnCount;
+      setLinkColumnCount(typeof restoredColumnCount === "number" && Number.isInteger(restoredColumnCount) && restoredColumnCount > 0
+        ? Math.min(100, restoredColumnCount) : 1);
+      setLinkColumnColors(sanitizeColumnLinkColors(restored.reviewTable?.linkColumnColors));
       setDocuments(restoredDocuments.entries);
       setTabs(nextTabs);
       setDocumentViews(restored.panel?.documentViews ?? {});
@@ -1276,17 +1358,12 @@ function ReviewWorkspace({
         );
         return entry ? { ...mark, documentId: entry.id, reviewRole: mark.side === "tor" ? "requirement" : undefined } : mark;
       }));
+      setTextPlacements(sanitizeRequirementTextPlacements(restored.textPlacements));
       setLinks(restored.links ?? []);
       setLeftWidth(
         Math.min(80, Math.max(20, Number(restored.panel?.leftWidth) || 50)),
       );
       setExplorerWidth(Math.min(440, Math.max(240, Number(restored.panel?.explorerWidth) || 300)));
-      setRequirementStartPath(
-        normalizeRequirementStartPath(
-          restored.panel?.requirementStartPath ??
-            restored.panel?.requirementStartNumber,
-        ),
-      );
       setIsReviewOpen(Boolean(restored.panel?.isReviewOpen));
       setIsReviewPinned(Boolean(restored.panel?.isReviewPinned));
       setShowTorPane(restored.panel?.showTorPane ?? true);
@@ -1333,13 +1410,13 @@ function ReviewWorkspace({
       savedAt,
       workspaceName: sanitizeWorkspaceName(workspaceName),
       marks: sanitizeMarksForStorage(marks),
+      textPlacements: sanitizeRequirementTextPlacements(textPlacements),
       links,
       documents,
-      reviewTable: { id: tableId, name: reviewTableName, kind: "review-table" },
+      reviewTable: { id: tableId, name: reviewTableName, kind: "review-table", linkColumnCount, linkColumnColors },
       tabs,
       panel: {
         leftWidth,
-        requirementStartPath,
         isReviewOpen,
         isReviewPinned,
         showTorPane,
@@ -1366,6 +1443,8 @@ function ReviewWorkspace({
     collapsedRequirements,
     documents,
     reviewTableName,
+    linkColumnCount,
+    linkColumnColors,
     documentViews,
     explorerWidth,
     files.left,
@@ -1379,7 +1458,7 @@ function ReviewWorkspace({
     leftWidth,
     links,
     marks,
-    requirementStartPath,
+    textPlacements,
     reviewFilter,
     tabs,
     workspaceId,
@@ -1457,12 +1536,45 @@ function ReviewWorkspace({
     return () => window.removeEventListener("comparex:mark-ready", jumpWhenReady);
   }, [pendingJumpId, pendingJumpSlot]);
 
+  useEffect(() => {
+    if (!pendingPlacementJumpId || !pendingPlacementJumpSlot) return;
+    const jumpWhenReady = (event: Event) => {
+      const { id, side } = (event as CustomEvent<{ id: string; side: "tor" | "catalog" }>).detail;
+      if (id !== pendingPlacementJumpId || side !== (pendingPlacementJumpSlot === "left" ? "tor" : "catalog")) return;
+      window.dispatchEvent(new CustomEvent("comparex:jump-to-placement", { detail: { id, side } }));
+      setPendingPlacementJumpId(null);
+      setPendingPlacementJumpSlot(null);
+    };
+    window.addEventListener("comparex:placement-ready", jumpWhenReady);
+    return () => window.removeEventListener("comparex:placement-ready", jumpWhenReady);
+  }, [pendingPlacementJumpId, pendingPlacementJumpSlot]);
+
   const openDocument = (slot: Slot, documentId: string) => {
     const item = catalogFiles.find((candidate) => candidate.id === documentId) ?? null;
     setActivePane(slot);
     setTabs((current) => openWorkspaceTab(current, slot, documentId));
     setFiles((current) => ({ ...current, [slot]: item }));
     if (!item && documentId !== tableId) setRestoreMessage("This document needs file access. Select it again in Explorer.");
+  };
+
+  const moveDocumentTab = (from: Slot, to: Slot, documentId: string) => {
+    if (from === to || !tabs[from].openIds.includes(documentId)) return;
+    const nextTabs = moveWorkspaceTab(tabs, from, to, documentId);
+    const sourceViewKey = `${from}:${documentId}`;
+    const targetViewKey = `${to}:${documentId}`;
+    setTabs(nextTabs);
+    setFiles((current) => ({
+      ...current,
+      [from]: catalogFiles.find((item) => item.id === nextTabs[from].activeId) ?? null,
+      [to]: catalogFiles.find((item) => item.id === documentId) ?? null,
+    }));
+    setDocumentViews((current) => current[sourceViewKey] && !current[targetViewKey]
+      ? { ...current, [targetViewKey]: current[sourceViewKey] }
+      : current,
+    );
+    if (to === "left") setShowTorPane(true);
+    else setShowEvidencePane(true);
+    setActivePane(to);
   };
 
   const openReviewTable = (slot: Slot = activePane) => openDocument(slot, tableId);
@@ -1597,10 +1709,11 @@ function ReviewWorkspace({
       return;
     }
     if (!window.confirm(
-      `Replace “${entry.name}”? Its saved highlights and their links will be removed because page locations may change.`,
+      `Replace “${entry.name}”? Its saved highlights, links, and placed text will be removed because page locations may change.`,
     )) return;
     const removedMarkIds = new Set(marks.filter((mark) => mark.documentId === entry.id).map((mark) => mark.id));
     setMarks((current) => current.filter((mark) => mark.documentId !== entry.id));
+    setTextPlacements((current) => current.filter((placement) => placement.documentId !== entry.id));
     setLinks((current) => removeWorkspaceLinksForItems(current, removedMarkIds));
     if (pendingLinkSourceId && removedMarkIds.has(pendingLinkSourceId)) setPendingLinkSourceId(null);
     const previous = catalogFiles.find((item) => item.id === entry.id);
@@ -1625,7 +1738,10 @@ function ReviewWorkspace({
 
   const selectForWorkspaceLink = (itemId: string) => {
     if (pendingLinkSourceId && pendingLinkSourceId !== itemId) {
-      setLinks((current) => addWorkspaceLink(current, pendingLinkSourceId, itemId, () => crypto.randomUUID()));
+      const row = gridRows.find((candidate) => candidate.kind === "requirement" &&
+        (candidate.mark.id === pendingLinkSourceId || candidate.mark.id === itemId));
+      if (row) linkRowHighlight(row.mark.id, row.mark.id === itemId ? pendingLinkSourceId : itemId);
+      else setLinks((current) => addWorkspaceLink(current, pendingLinkSourceId, itemId, () => crypto.randomUUID()));
       setPendingLinkSourceId(null);
       setInteractionMode("highlight");
     } else {
@@ -1636,7 +1752,7 @@ function ReviewWorkspace({
   };
 
   const removeDocument = (entry: WorkspaceDocument) => {
-    if (!window.confirm(`Remove “${entry.name}” and its highlights from this workspace?`)) return;
+    if (!window.confirm(`Remove “${entry.name}”, its highlights, and placed text from this workspace?`)) return;
     const loaded = catalogFiles.find((item) => item.id === entry.id);
     if (loaded) URL.revokeObjectURL(loaded.url);
     setDocuments((current) => current.filter((item) => item.id !== entry.id));
@@ -1648,6 +1764,7 @@ function ReviewWorkspace({
       return next;
     });
     setMarks((current) => current.filter((mark) => mark.documentId !== entry.id));
+    setTextPlacements((current) => current.filter((placement) => placement.documentId !== entry.id));
     const removedMarkIds = new Set(marks.filter((mark) => mark.documentId === entry.id).map((mark) => mark.id));
     if (pendingLinkSourceId && removedMarkIds.has(pendingLinkSourceId)) setPendingLinkSourceId(null);
     setLinks((current) => removeWorkspaceLinksForItems(current, removedMarkIds));
@@ -1683,22 +1800,33 @@ function ReviewWorkspace({
       (tabs.left.activeId === tableId || tabs.right.activeId === tableId) &&
       marks.some((item) => item.id === activeEvidenceRowId && item.reviewRole !== "highlight" && !item.referenceOnly)
     ) {
-      setLinks((current) => addWorkspaceLink(current, activeEvidenceRowId, mark.id, () => crypto.randomUUID()));
+      linkRowHighlight(activeEvidenceRowId, mark.id, activeLinkColumn ?? undefined);
       if (autoAdvanceEvidence) {
         const nextId = nextRequirementRowId(gridRows, activeEvidenceRowId);
         if (nextId) {
+          const nextRow = gridRows.find((row) => row.kind === "requirement" && row.mark.id === nextId);
+          const nextColumn = nextAvailableLinkColumn(nextRow?.links ?? [], activeLinkColumn ?? undefined);
+          setLinkColumnCount((current) => Math.max(current, nextColumn));
+          setActiveLinkColumn(nextColumn);
           setActiveEvidenceRowId(nextId);
           setFocusEvidenceMarkId(nextId);
           setAutoAdvanceNotice("");
         } else {
           setAutoAdvanceEvidence(false);
           setAutoAdvanceNotice("Last requirement reached. Auto next stopped.");
+          setActiveEvidenceRowId(null);
+          setActiveLinkColumn(null);
         }
+      } else {
+        setActiveEvidenceRowId(null);
+        setActiveLinkColumn(null);
       }
     }
     if (intent === "link") {
       if (pendingLinkSourceId && pendingLinkSourceId !== mark.id) {
-        setLinks((current) => addWorkspaceLink(current, pendingLinkSourceId, mark.id, () => crypto.randomUUID()));
+        const row = gridRows.find((candidate) => candidate.kind === "requirement" && candidate.mark.id === pendingLinkSourceId);
+        if (row) linkRowHighlight(row.mark.id, mark.id);
+        else setLinks((current) => addWorkspaceLink(current, pendingLinkSourceId, mark.id, () => crypto.randomUUID()));
         setPendingLinkSourceId(null);
         setInteractionMode("highlight");
       } else {
@@ -1717,6 +1845,7 @@ function ReviewWorkspace({
         ),
     );
     setLinks((current) => removeWorkspaceLinksForItems(current, new Set([mark.id])));
+    setTextPlacements((current) => current.filter((placement) => placement.rowId !== mark.id));
     if (pendingLinkSourceId === mark.id) setPendingLinkSourceId(null);
     if (pendingLinkId && mark.linkId === pendingLinkId) {
       setPendingLinkId(null);
@@ -1729,9 +1858,10 @@ function ReviewWorkspace({
   const removeRequirements = (requirements: EvidenceMark[]) => {
     const ids = new Set(requirements.map((item) => item.id));
     const label = requirements.length === 1 ? "requirement" : "requirements";
+    const placedCount = textPlacements.filter((placement) => ids.has(placement.rowId)).length;
     if (
       !window.confirm(
-        `Remove ${requirements.length} selected ${label}? Supporting evidence will remain unassigned.`,
+        `Remove ${requirements.length} selected ${label}? Supporting evidence will remain unassigned.${placedCount ? ` ${placedCount} placed text annotation${placedCount === 1 ? "" : "s"} will also be removed.` : ""}`,
       )
     ) {
       return;
@@ -1746,6 +1876,7 @@ function ReviewWorkspace({
         ),
     );
     setLinks((current) => removeWorkspaceLinksForItems(current, ids));
+    setTextPlacements((current) => current.filter((placement) => !ids.has(placement.rowId)));
     if (pendingLinkSourceId && ids.has(pendingLinkSourceId)) setPendingLinkSourceId(null);
     requirements.forEach((item) => {
       window.dispatchEvent(
@@ -1786,27 +1917,17 @@ function ReviewWorkspace({
   const createManualRequirements = (
     items: Array<{ number: string; title: string }>,
   ) => {
-    const idsByNumber = new Map<string, string>();
-    const additions = items.map((item) => {
-      const id = crypto.randomUUID();
-      idsByNumber.set(toAsciiDigits(item.number), id);
-      return { ...item, id };
-    });
     setMarks((current) => [
       ...current,
-      ...additions.map((item) => {
-        const parentNumber = getParentRequirementNumber(item.number);
-        return {
-          id: item.id,
+      ...items.map((item) => ({
+          id: crypto.randomUUID(),
           side: "tor" as const,
           fileName: "Manual requirement",
           page: 0,
           text: item.title,
           manual: true,
-          requirementNo: item.number,
-          parentId: parentNumber ? idsByNumber.get(parentNumber) : undefined,
-        };
-      }),
+          requirementNo: item.number || undefined,
+        })),
     ]);
   };
 
@@ -1821,99 +1942,20 @@ function ReviewWorkspace({
   };
 
   const renameRequirementNo = (mark: EvidenceMark, requirementNo: string) => {
-    const normalizedNumber = requirementNo.trim();
-    const isStructuralNumber = /^\d+(?:\.\d+)*$/.test(normalizedNumber);
-    if (!isStructuralNumber) {
-      setMarks((current) =>
-        current.map((item) =>
-          item.id === mark.id
-            ? { ...item, requirementNo: normalizedNumber }
-            : item,
-        ),
-      );
-      return;
-    }
-
-    const numberParts = normalizedNumber.split(".").map(Number);
-    if (numberParts.some((part) => part < 1)) return;
-
-    const roots = torMarks.filter(
-      (item) =>
-        !item.parentId ||
-        !torMarks.some((candidate) => candidate.id === item.parentId),
-    );
-    const flattenCurrentNumbers = (
-      items: EvidenceMark[],
-      prefix = "",
-    ): Array<{ mark: EvidenceMark; path: string }> =>
-      items.flatMap((item, index) => {
-        const fallbackPath = prefix
-          ? `${prefix}.${index + 1}`
-          : getRootRequirementPath(requirementStartPath, index);
-        const path = item.requirementNo?.trim() || fallbackPath;
-        const children = torMarks.filter((child) => child.parentId === item.id);
-        return [
-          { mark: item, path },
-          ...flattenCurrentNumbers(children, path),
-        ];
-      });
-    const flattened = flattenCurrentNumbers(roots);
-    const currentItem = flattened.find((item) => item.mark.id === mark.id);
-    const currentNumber =
-      currentItem?.path || mark.requirementNo?.trim() || normalizedNumber;
-    const descendants = flattened.filter(
-      (item) =>
-        item.mark.id !== mark.id && item.path.startsWith(`${currentNumber}.`),
-    );
-    const shouldUpdateHierarchy =
-      descendants.length > 0 &&
-      window.confirm(
-        `Change this requirement and ${descendants.length} sub-requirement${descendants.length === 1 ? "" : "s"} from ${currentNumber} to ${normalizedNumber}?`,
-      );
-    const nextNumberById = new Map(
-      shouldUpdateHierarchy
-        ? descendants.map((item) => [
-            item.mark.id,
-            `${normalizedNumber}${item.path.slice(currentNumber.length)}`,
-          ])
-        : [],
-    );
-
-    setMarks((current) => {
-      if (!shouldUpdateHierarchy) {
-        return current.map((item) =>
-          item.id === mark.id
-            ? { ...item, requirementNo: normalizedNumber }
-            : item,
-        );
-      }
-
-      return current.map((item) =>
-        item.id === mark.id
-          ? { ...item, requirementNo: normalizedNumber }
-          : nextNumberById.has(item.id)
-            ? { ...item, requirementNo: nextNumberById.get(item.id) }
-            : item,
-      );
-    });
-  };
-
-  const changeRequirementParent = (mark: EvidenceMark, parentId?: string) => {
-    if (parentId === mark.id) return;
-    const byId = new Map(torMarks.map((item) => [item.id, item]));
-    let ancestorId = parentId;
-    while (ancestorId) {
-      if (ancestorId === mark.id) return;
-      ancestorId = byId.get(ancestorId)?.parentId;
-    }
     setMarks((current) =>
       current.map((item) =>
-        // A hierarchy change makes the structural number authoritative again.
         item.id === mark.id
-          ? { ...item, parentId, requirementNo: undefined }
+          ? { ...item, requirementNo: requirementNo.trim() }
           : item,
       ),
     );
+  };
+
+  const moveRequirementRows = (sourceIds: string[], targetId: string, edge: "before" | "after") => {
+    setMarks((current) => moveTableRows(current, sourceIds, targetId, (item) =>
+      item.side === "tor" && item.reviewRole !== "highlight" && !item.referenceOnly,
+      edge,
+    ));
   };
 
   const addManualRequirement = () => {
@@ -1990,7 +2032,7 @@ function ReviewWorkspace({
       (mark) => mark.id === evidenceId && !mark.manual && mark.id !== torMark.id,
     );
     if (!evidenceMark) return;
-    setLinks((current) => addWorkspaceLink(current, torMark.id, evidenceMark.id, () => crypto.randomUUID()));
+    linkRowHighlight(torMark.id, evidenceMark.id);
     setPendingLinkId(null);
     setDragOverTorId(null);
   };
@@ -2033,6 +2075,29 @@ function ReviewWorkspace({
     openDocument(slot, targetFile.id);
   };
 
+  const jumpToPlacedText = (placement: RequirementTextPlacement) => {
+    const targetFile = catalogFiles.find((item) => item.id === placement.documentId);
+    const tableSlot: Slot | null = tabs.left.activeId === tableId
+      ? "left" : tabs.right.activeId === tableId ? "right" : null;
+    const slot: Slot = tableSlot === "left" ? "right" : tableSlot === "right" ? "left" : activePane;
+    if (!targetFile) {
+      const fileName = documents.find((item) => item.id === placement.documentId)?.name ?? "this PDF";
+      setRestoreMessage(`Select ${fileName} again to open this placed text.`);
+      return;
+    }
+    if (slot === "left") setShowTorPane(true);
+    else setShowEvidencePane(true);
+    const side = slot === "left" ? "tor" : "catalog";
+    const paneVisible = slot === "left" ? showTorPane : showEvidencePane;
+    if (files[slot]?.id === targetFile.id && paneVisible) {
+      window.dispatchEvent(new CustomEvent("comparex:jump-to-placement", { detail: { id: placement.id, side } }));
+      return;
+    }
+    setPendingPlacementJumpId(placement.id);
+    setPendingPlacementJumpSlot(slot);
+    openDocument(slot, targetFile.id);
+  };
+
   const linkGroups = marks.reduce((groups, mark) => {
       if (!mark.linkId) return groups;
       groups.set(mark.linkId, (groups.get(mark.linkId) ?? 0) + 1);
@@ -2051,29 +2116,20 @@ function ReviewWorkspace({
     (mark) => mark.side === "tor" && mark.reviewRole !== "highlight" && !mark.referenceOnly,
   );
   const tableRowIds = new Set(torMarks.map((mark) => mark.id));
+  const colorsByMarkId = useMemo(() => colorsByTableColumns(
+    marks,
+    marks.filter((mark) => mark.side === "tor" && mark.reviewRole !== "highlight" && !mark.referenceOnly),
+    links,
+    linkColumnColors,
+  ), [links, linkColumnColors, marks]);
   const unlinkedCatalogMarks = unassignedTableHighlights(allHighlights, tableRowIds, pairedLinkIds, links);
   const unlinkedCount = highlightCount - linkedCount;
   const visibleTorMarks = torMarks;
   const visibleTorIds = new Set(visibleTorMarks.map((mark) => mark.id));
-  const rootRequirements = torMarks.filter(
-    (mark) => !mark.parentId || !torMarks.some((item) => item.id === mark.parentId),
-  );
-  const flattenRequirements = (
-    items: EvidenceMark[],
-    prefix = "",
-    depth = 0,
-  ): Array<{ mark: EvidenceMark; path: string; depth: number }> =>
-    items.flatMap((mark, index) => {
-      const path = prefix
-        ? appendRequirementPath(prefix, index + 1)
-        : getRootRequirementPath(requirementStartPath, index);
-      const children = torMarks.filter((item) => item.parentId === mark.id);
-      return [
-        { mark, path, depth },
-        ...flattenRequirements(children, path, depth + 1),
-      ];
-    });
-  const allRequirementRows = flattenRequirements(rootRequirements);
+  const allRequirementRows = torMarks.map((mark) => ({
+    mark,
+    path: mark.requirementNo?.trim() ?? "",
+  }));
   const requirementRows = allRequirementRows.filter(({ mark }) =>
     visibleTorIds.has(mark.id),
   );
@@ -2101,12 +2157,12 @@ function ReviewWorkspace({
     string,
     { requirementNo: string; text: string }
   >();
-  for (const { mark, path } of allRequirementRows) {
+  for (const { mark } of allRequirementRows) {
     if (!mark.linkId) continue;
-    const requirementNo = mark.requirementNo?.trim() || path;
+    const requirementNo = mark.requirementNo?.trim() ?? "";
     const rootRequirement = getRootRequirementRow(mark);
     const rootRequirementNo =
-      rootRequirement?.mark.requirementNo?.trim() || rootRequirement?.path;
+      rootRequirement?.mark.requirementNo?.trim();
 
     requirementNumberByLinkId.set(mark.linkId, requirementNo);
     if (rootRequirementNo && rootRequirement) {
@@ -2118,35 +2174,106 @@ function ReviewWorkspace({
   }
   const requirementNumbersByMarkId = useMemo(() => requirementNumbersByEvidenceMark(
     marks,
-    allRequirementRows.map(({ mark, path }) => ({
+    allRequirementRows.map(({ mark }) => ({
       mark,
-      number: mark.requirementNo?.trim() || path,
+      number: mark.requirementNo?.trim() ?? "",
     })),
     links,
-  ), [marks, links, requirementStartPath]);
+  ), [marks, links]);
+  const textPlacementsByRow = useMemo(() => {
+    const grouped = new Map<string, RequirementTextPlacement[]>();
+    for (const placement of textPlacements) {
+      const rowPlacements = grouped.get(placement.rowId) ?? [];
+      rowPlacements.push(placement);
+      grouped.set(placement.rowId, rowPlacements);
+    }
+    return grouped;
+  }, [textPlacements]);
+  const placedTextCountByRow = useMemo(() => new Map(
+    Array.from(textPlacementsByRow, ([rowId, placements]) => [rowId, placements.length]),
+  ), [textPlacementsByRow]);
   const gridRows: RequirementGridRow[] = [
-    ...requirementRows.map(({ mark, path, depth }) => ({
+    ...requirementRows.map(({ mark, path }) => ({
       kind: "requirement" as const,
       mark,
       path,
-      depth,
-      evidence: tableEvidenceForRow(marks, mark, links),
+      links: tableLinkSlotsForRow(marks, mark, links).map(({ mark: linkedMark, column }) => ({
+        mark: linkedMark,
+        column,
+        color: columnLinkColor(linkColumnColors, column),
+      })),
     })),
     ...unlinkedCatalogMarks.map((mark) => ({
       kind: "unassigned" as const,
       mark,
       path: "" as const,
-      depth: 0 as const,
-      evidence: [],
+      links: [{ mark, color: columnLinkColor(linkColumnColors, 1), column: 1 }],
     })),
   ];
+  const linkRowHighlight = (rowId: string, markId: string, preferredColumn?: number) => {
+    const row = gridRows.find((candidate) => candidate.kind === "requirement" && candidate.mark.id === rowId);
+    const existingColumn = row?.links.find((link) => link.mark.id === markId)?.column;
+    const availableLinks = row?.links.filter((link) => link.mark.id !== markId) ?? [];
+    const column = preferredColumn === undefined && existingColumn
+      ? existingColumn
+      : nextAvailableLinkColumn(availableLinks, preferredColumn);
+    setLinkColumnCount((current) => Math.max(current, column));
+    setLinks((current) => addWorkspaceLink(current, rowId, markId, () => crypto.randomUUID(), column));
+    return column;
+  };
   const activeEvidenceRow = gridRows.find((row) =>
     row.kind === "requirement" && row.mark.id === activeEvidenceRowId,
   );
+  const activeTextRow = interactionMode === "highlight" ? gridRows.find((row) =>
+    row.kind === "requirement" && row.mark.id === activeTextRowId,
+  ) : undefined;
+  const placeRequirementText = (documentId: string, page: number, x: number, y: number) => {
+    if (!activeTextRow || !activeTextRow.mark.text.trim()) return false;
+    if (activeTextRow.mark.text.length > 2000) {
+      window.alert("Requirement text is too long to place on a PDF page.");
+      return false;
+    }
+    setTextPlacements((current) => [...current, {
+      id: crypto.randomUUID(),
+      rowId: activeTextRow.mark.id,
+      documentId,
+      page,
+      x,
+      y,
+      text: activeTextRow.mark.text,
+    }]);
+    setPlacedTextMenu(null);
+    setActiveTextRowId(null);
+    return true;
+  };
   const directEvidenceTargetId = interactionMode === "highlight" && activeEvidenceRow &&
     (tabs.left.activeId === tableId || tabs.right.activeId === tableId)
     ? activeEvidenceRow.mark.id
     : null;
+  const selectedPlacedRow = placedTextMenu
+    ? gridRows.find((row) => row.kind === "requirement" && row.mark.id === placedTextMenu.rowId)
+    : undefined;
+  const selectedRowPlacements = placedTextMenu ? textPlacementsByRow.get(placedTextMenu.rowId) ?? [] : [];
+
+  useEffect(() => {
+    if (!placedTextMenu) return;
+    placedTextMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const closeOnOutsideClick = (event: globalThis.PointerEvent) => {
+      if (!placedTextMenuRef.current?.contains(event.target as Node)) setPlacedTextMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPlacedTextMenu(null);
+        placedTextReturnFocusRef.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [placedTextMenu]);
 
   const getPrintableEvidenceAnnotations = (evidenceFile: UploadedFile) =>
     marks.flatMap<PdfAnnotation>((mark) => {
@@ -2164,9 +2291,12 @@ function ReviewWorkspace({
             mark,
             anchor,
             requirementNo: requirementNumbersByMarkId.get(mark.id)?.join(" · #"),
+            colors: colorsByMarkId.get(mark.id) ?? [resolveLinkColor(mark.color)],
           }]
         : [];
     });
+  const getPrintableTextPlacements = (evidenceFile: UploadedFile) =>
+    textPlacements.filter((placement) => placement.documentId === evidenceFile.id);
 
   const compareRequirementNumbers = (left: string, right: string) => {
     const leftParts = left.split(".");
@@ -2257,8 +2387,9 @@ function ReviewWorkspace({
     if (!evidenceFile || !isPdfFile(evidenceFile.file)) return;
 
     const annotations = getPrintableEvidenceAnnotations(evidenceFile);
-    if (!annotations.length) {
-      window.alert("No highlights with a saved position to download.");
+    const printableText = getPrintableTextPlacements(evidenceFile);
+    if (!annotations.length && !printableText.length) {
+      window.alert("No highlights or placed text to download.");
       return;
     }
 
@@ -2272,6 +2403,7 @@ function ReviewWorkspace({
         evidenceFile.file,
         annotations,
         outputTitle,
+        printableText,
       );
       downloadPdfBlob(exported, outputTitle);
     } catch (error) {
@@ -2303,6 +2435,7 @@ function ReviewWorkspace({
               item.file,
               getPrintableEvidenceAnnotations(item),
               getWorkspaceOutputTitle(item.file.name.replace(/\.pdf$/i, "")),
+              getPrintableTextPlacements(item),
             ),
           );
         } catch (error) {
@@ -2363,16 +2496,20 @@ function ReviewWorkspace({
     setDocumentStatuses({});
     setDocuments([]);
     setReviewTableName("Review Table");
+    setLinkColumnCount(1);
+    setLinkColumnColors({});
     setTabs(initialWorkspaceTabs(workspaceId));
     setDocumentViews({});
     setExplorerWidth(300);
     setOpenExplorerMenuId(null);
     setMarks([]);
+    setTextPlacements([]);
+    setActiveTextRowId(null);
+    setPlacedTextMenu(null);
     setLinks([]);
     setPendingLinkSourceId(null);
     setWorkspaceName("Untitled workspace");
     setLeftWidth(50);
-    setRequirementStartPath("1");
     setIsResizing(false);
     setCatalogLabelOffset(null);
     setPendingLinkId(null);
@@ -2383,7 +2520,11 @@ function ReviewWorkspace({
     setReviewFilter("all");
     setDragOverTorId(null);
     setPendingJumpId(null);
+    setPendingPlacementJumpId(null);
+    setPendingPlacementJumpSlot(null);
     setFocusTableMarkId(null);
+    setActiveEvidenceRowId(null);
+    setActiveLinkColumn(null);
     setInteractionMode("highlight");
     setCollapsedRequirements(new Set());
     setRequirementComposer(null);
@@ -2570,9 +2711,11 @@ function ReviewWorkspace({
   };
 
   const downloadableCatalogFiles = catalogFiles.filter((item) =>
-    isPdfFile(item.file) && getPrintableEvidenceAnnotations(item).length > 0,
+    isPdfFile(item.file) && (getPrintableEvidenceAnnotations(item).length > 0 || getPrintableTextPlacements(item).length > 0),
   );
   const visibleDocumentPaneCount = Number(showTorPane) + Number(showEvidencePane);
+  const isReviewTableVisible = (showTorPane && tabs.left.activeId === tableId) ||
+    (showEvidencePane && tabs.right.activeId === tableId);
   const workspaceVisibilityClass =
     visibleDocumentPaneCount === 0
       ? "no-document-panes"
@@ -2586,93 +2729,132 @@ function ReviewWorkspace({
     name: item.name,
     kind: "pdf" as const,
   }))];
-  const openEditorLabels = (id: string) =>
-    [tabs.left.activeId === id ? "Editor 1" : null, tabs.right.activeId === id ? "Editor 2" : null]
-      .filter(Boolean).join(" and ") || "no editor";
+  const openPaneLabels = (id: string) =>
+    [tabs.left.activeId === id ? paneLabel("left") : null, tabs.right.activeId === id ? paneLabel("right") : null]
+      .filter(Boolean).join(" and ") || "no pane";
 
   const renderReviewTable = (slot: Slot) => (
-    <section className="review-table-editor" aria-label={`${reviewTableName} in ${slot === "left" ? "Editor 1" : "Editor 2"}`}>
+    <section
+      className="review-table-editor"
+      aria-label={`${reviewTableName} in ${paneLabel(slot)}`}
+      onDragOver={(event) => {
+        if (event.dataTransfer.types.includes(WORKSPACE_TAB_DRAG_TYPE)) {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+        }
+      }}
+      onDrop={(event) => {
+        const tab = readDraggedWorkspaceTab(event);
+        if (!tab) return;
+        event.preventDefault();
+        moveDocumentTab(tab.from, slot, tab.id);
+      }}
+    >
       <EditorTabs
         slot={slot}
         pane={tabs[slot]}
         documents={editorItems}
         onOpen={(id) => openDocument(slot, id)}
         onClose={(id) => closeDocumentTab(slot, id)}
+        onMove={(from, id) => moveDocumentTab(from, slot, id)}
         onAdd={() => void openCatalogPicker(undefined, slot)}
         onDownload={() => undefined}
       />
       <div className="review-table-body">
-        <div className="requirement-list-toolbar">
-          <strong>{reviewTableName} <span>· {torMarks.length} rows</span></strong>
-          <label className="requirement-start-control">
-            <span>Start no.</span>
-            <input
-              type="text"
-              inputMode="decimal"
-              pattern="[0-9๐-๙]+(\\.[0-9๐-๙]+)*"
-              value={requirementStartPath}
-              onChange={(event) => setRequirementStartPath(event.target.value)}
-              onBlur={() => setRequirementStartPath((current) => normalizeRequirementStartPath(current))}
-            />
-          </label>
-          <button type="button" onClick={() => setRequirementComposer({ parentId: null, value: "" })}>
-            <Plus size={14} aria-hidden="true" /> Add row
-          </button>
-        </div>
-        {activeEvidenceRow ? (
-          <div className="review-table-hint review-table-evidence-target" role="status">
-            <span><strong>Evidence for row {activeEvidenceRow.path} selected.</strong> {autoAdvanceNotice || "Select text or drag an area in the PDF; it will be highlighted and linked automatically."}</span>
-            <div className="review-table-evidence-actions">
-              <button
-                type="button"
-                className={autoAdvanceEvidence ? "active" : ""}
-                aria-pressed={autoAdvanceEvidence}
-                onClick={() => {
-                  setAutoAdvanceEvidence((current) => !current);
-                  setAutoAdvanceNotice("");
-                }}
-              >
-                Auto next {autoAdvanceEvidence ? "On" : "Off"}
-              </button>
-              <button type="button" onClick={() => {
-                setFocusTableMarkId(activeEvidenceRow.mark.id);
-                setActiveEvidenceRowId(null);
-                setAutoAdvanceEvidence(false);
-                setAutoAdvanceNotice("");
-              }}>Cancel</button>
-            </div>
-          </div>
-        ) : (
-          <p className="review-table-hint">Select a source to open its PDF. Select Evidence to choose a linked highlight or add one from the PDF. In Link mode, select a row to link it with a highlight.</p>
-        )}
-        {requirementComposer ? renderRequirementComposer(requirementComposer.parentId) : null}
         <RequirementGrid
           rows={gridRows}
+          linkColumnCount={linkColumnCount}
+          linkColumnColors={linkColumnColors}
+          onAddLinkColumn={() => setLinkColumnCount((current) => Math.min(100, current + 1))}
+          onChangeColumnColor={(column, color) => setLinkColumnColors((current) => ({ ...current, [column]: color }))}
           showStartHint={!torMarks.length}
           focusMarkId={focusTableMarkId}
           onFocusHandled={() => setFocusTableMarkId(null)}
           focusEvidenceMarkId={focusEvidenceMarkId}
           onEvidenceFocusHandled={() => setFocusEvidenceMarkId(null)}
-          onJump={jumpToEvidenceMark}
-          onUnlink={unlinkEvidenceMark}
+          onJump={(mark) => { setPlacedTextMenu(null); jumpToEvidenceMark(mark); }}
           onDropEvidence={linkDroppedEvidence}
           onAddRequirement={(title) => createManualRequirement(title)}
           onAddRequirements={createManualRequirements}
           onRenameRequirement={renameRequirement}
           onRenameRequirementNo={renameRequirementNo}
-          onChangeParent={changeRequirementParent}
+          onMoveRequirements={moveRequirementRows}
           isLinkMode={interactionMode === "link"}
           onSelectForLink={(mark) => selectForWorkspaceLink(mark.id)}
-          onEvidenceTargetChange={(mark) => {
+          activeLinkRowId={activeEvidenceRowId}
+          activeLinkColumn={activeLinkColumn}
+          onEvidenceTargetChange={(mark, column) => {
+            if (mark) setPlacedTextMenu(null);
             const nextId = mark?.id ?? null;
             if (focusEvidenceMarkId && nextId !== focusEvidenceMarkId) return;
             if (nextId !== activeEvidenceRowId) setAutoAdvanceNotice("");
+            if (mark && (nextId !== activeEvidenceRowId || (column ?? 1) !== activeLinkColumn)) {
+              setAutoAdvanceEvidence(true);
+            }
             setActiveEvidenceRowId(nextId);
+            setActiveLinkColumn(mark ? column ?? 1 : null);
             if (!mark) setAutoAdvanceEvidence(false);
           }}
+          onRequirementTargetChange={(mark) => {
+            setActiveTextRowId(mark?.id ?? null);
+            if (mark) setPlacedTextMenu(null);
+          }}
+          placedTextCountByRow={placedTextCountByRow}
+          onJumpToPlacedText={(rowId) => {
+            const placement = latestRequirementTextPlacement(textPlacements, rowId);
+            if (!placement) return;
+            setActiveTextRowId(null);
+            setPlacedTextMenu(null);
+            jumpToPlacedText(placement);
+          }}
+          onOpenPlacedTextMenu={(rowId, bounds) => {
+            placedTextReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+            setPlacedTextMenu({
+              rowId,
+              left: Math.max(8, Math.min(window.innerWidth - 340, bounds.x)),
+              top: Math.max(8, Math.min(window.innerHeight - 280, bounds.y + bounds.height + 4)),
+            });
+          }}
+          onDeletePlacedText={(rowIds) => {
+            setTextPlacements((current) => removeRequirementTextPlacements(current, rowIds));
+            if (placedTextMenu && rowIds.includes(placedTextMenu.rowId)) setPlacedTextMenu(null);
+          }}
           onDeleteRequirements={removeRequirements}
-          onRemoveUnassignedEvidence={removeEvidenceMark}
+          onRemoveHighlight={removeEvidenceMark}
         />
+        {placedTextMenu && selectedPlacedRow && selectedRowPlacements.length ? (
+          <div
+            ref={placedTextMenuRef}
+            className="placed-text-menu"
+            role="group"
+            aria-label={`Placed text for ${selectedPlacedRow.path ? `No. ${selectedPlacedRow.path}` : "selected row"}`}
+            style={{ left: placedTextMenu.left, top: placedTextMenu.top }}
+          >
+            <strong>Placed text for {selectedPlacedRow.path ? `No. ${selectedPlacedRow.path}` : "selected row"}</strong>
+            <div className="placed-text-location-list">
+              {selectedRowPlacements.map((placement, index) => (
+                <div className="placed-text-location" key={placement.id}>
+                  <button type="button" onClick={() => {
+                    setPlacedTextMenu(null);
+                    jumpToPlacedText(placement);
+                  }}>
+                    {documents.find((item) => item.id === placement.documentId)?.name ?? "Unavailable PDF"} · p.{placement.page}{selectedRowPlacements.length > 1 ? ` · copy ${index + 1}` : ""}
+                  </button>
+                  <button type="button" onClick={() => {
+                    setTextPlacements((current) => current.filter((item) => item.id !== placement.id));
+                    if (selectedRowPlacements.length === 1) setPlacedTextMenu(null);
+                  }} aria-label={`Remove placed text copy ${index + 1} from page ${placement.page}`}>
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+            <button type="button" onClick={() => {
+              setPlacedTextMenu(null);
+              setActiveTextRowId(selectedPlacedRow.mark.id);
+            }}>Place another copy</button>
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -2690,14 +2872,20 @@ function ReviewWorkspace({
   return (
     <main className={`app-shell ${isReviewPinned ? "review-pinned" : ""}`}>
       <header className="topbar">
-        <div className="toolbar-brand">
+        <button
+          type="button"
+          className="toolbar-brand"
+          onClick={onCloseWorkspace}
+          aria-label="Back to Workspaces"
+          title="Back to Workspaces"
+        >
           <Image
             src={comparexLogo}
-            alt="COMPAREX"
+            alt=""
             width={158}
             priority
           />
-        </div>
+        </button>
 
         <button
           className="explorer-toggle"
@@ -2810,26 +2998,26 @@ function ReviewWorkspace({
             <span>Highlights {highlightCount}</span>
           </button>
           <button
-            className={`tool-button ${showTorPane ? "active-tool" : ""}`}
+            className={`tool-button pane-toggle ${showTorPane ? "active-tool" : ""}`}
             type="button"
             onClick={() => setShowTorPane((current) => !current)}
             aria-pressed={showTorPane}
             aria-controls="tor-panel"
-            title={showTorPane ? "Hide Editor 1" : "Show Editor 1"}
+            aria-label={showTorPane ? "Hide left pane" : "Show left pane"}
+            title={showTorPane ? "Hide left pane" : "Show left pane"}
           >
-            <FileText aria-hidden="true" size={17} />
-            <span>Editor 1</span>
+            <PanelLeft aria-hidden="true" size={17} />
           </button>
           <button
-            className={`tool-button ${showEvidencePane ? "active-tool" : ""}`}
+            className={`tool-button pane-toggle ${showEvidencePane ? "active-tool" : ""}`}
             type="button"
             onClick={() => setShowEvidencePane((current) => !current)}
             aria-pressed={showEvidencePane}
             aria-controls="evidence-panel"
-            title={showEvidencePane ? "Hide Editor 2" : "Show Editor 2"}
+            aria-label={showEvidencePane ? "Hide right pane" : "Show right pane"}
+            title={showEvidencePane ? "Hide right pane" : "Show right pane"}
           >
-            <FilesIcon aria-hidden="true" size={17} />
-            <span>Editor 2</span>
+            <PanelRight aria-hidden="true" size={17} />
           </button>
           <span className="toolbar-separator" aria-hidden="true" />
           <button
@@ -2856,6 +3044,61 @@ function ReviewWorkspace({
             <span>{isClearingProject ? "Clearing..." : "Clear Project"}</span>
           </button>
         </nav>
+
+        {isReviewTableVisible ? (
+          <div className="review-table-topbar" role="group" aria-label="Review Table tools">
+            {activeTextRow ? (
+              <span
+                className="review-table-topbar-status"
+                role="status"
+                aria-label={`Placing Requirement text from ${activeTextRow.path ? `No. ${activeTextRow.path}` : "selected row"}. Click the PDF page to place a copy. Later row edits will not update it; the exported copy is visible but not searchable.`}
+                title="Click the PDF page to place a copy. Later row edits will not update it; the exported copy is visible but not searchable."
+              >
+                Text · {activeTextRow.path || "selected row"} → PDF
+              </span>
+            ) : activeEvidenceRow ? (
+              <span
+                className="review-table-topbar-status"
+                role="status"
+                aria-label={`Adding Link ${activeLinkColumn ?? 1} to ${activeEvidenceRow.path ? `No. ${activeEvidenceRow.path}` : "selected row"}. Select text or drag an area in the PDF to highlight and link it automatically.`}
+                title="Select text or drag an area in the PDF to highlight and link it automatically."
+              >
+                Link {activeLinkColumn ?? 1} · {activeEvidenceRow.path || "selected row"} → PDF
+              </span>
+            ) : autoAdvanceNotice ? (
+              <span className="review-table-topbar-status" role="status">{autoAdvanceNotice}</span>
+            ) : null}
+            {activeTextRow ? <button type="button" onClick={() => setActiveTextRowId(null)}>Cancel</button> : null}
+            {!activeTextRow && activeEvidenceRow ? (
+              <>
+                <button
+                  type="button"
+                  className={autoAdvanceEvidence ? "auto-next-toggle active" : "auto-next-toggle"}
+                  aria-pressed={autoAdvanceEvidence}
+                  onClick={() => {
+                    setAutoAdvanceEvidence((current) => !current);
+                    setAutoAdvanceNotice("");
+                  }}
+                >
+                  Auto next {autoAdvanceEvidence ? "On" : "Off"}
+                </button>
+                <button type="button" onClick={() => {
+                  setFocusTableMarkId(activeEvidenceRow.mark.id);
+                  setActiveEvidenceRowId(null);
+                  setActiveLinkColumn(null);
+                  setAutoAdvanceEvidence(false);
+                  setAutoAdvanceNotice("");
+                }}>Cancel</button>
+              </>
+            ) : null}
+            <button type="button" className="review-table-add-row" onClick={() => setRequirementComposer({ parentId: null, value: "" })} aria-label="Add Review Table row" title="Add row">
+              <Plus size={14} aria-hidden="true" /><span>Add row</span>
+            </button>
+            {requirementComposer?.parentId === null ? (
+              <div className="review-table-topbar-composer">{renderRequirementComposer(null)}</div>
+            ) : null}
+          </div>
+        ) : null}
 
         <div
           className="privacy-status"
@@ -2960,13 +3203,9 @@ function ReviewWorkspace({
                     }}
                   />
                 ) : (
-                  <button type="button" className="explorer-document-main" onClick={() => openReviewTable()} title={`Open ${reviewTableName} in ${activePane === "left" ? "Editor 1" : "Editor 2"}`} aria-label={`Open ${reviewTableName} in ${activePane === "left" ? "Editor 1" : "Editor 2"}. Currently open in ${openEditorLabels(tableId)}.`}>
+                  <button type="button" className="explorer-document-main" onClick={() => openReviewTable()} title={`Open ${reviewTableName} in ${paneLabel(activePane)}`} aria-label={`Open ${reviewTableName} in ${paneLabel(activePane)}. Currently open in ${openPaneLabels(tableId)}.`}>
                     <Table2 size={17} aria-hidden="true" />
                     <span><strong>{reviewTableName}</strong><small>Table · {torMarks.length} rows</small></span>
-                    <span className="explorer-pane-badges" aria-hidden="true">
-                      {tabs.left.activeId === tableId ? <b>1</b> : null}
-                      {tabs.right.activeId === tableId ? <b>2</b> : null}
-                    </span>
                   </button>
                 )}
                 <button
@@ -2979,7 +3218,7 @@ function ReviewWorkspace({
                 ><MoreHorizontal size={17} aria-hidden="true" /></button>
               </div>
               {openExplorerMenuId === tableId ? <div data-explorer-actions className="explorer-document-menu" aria-label={`Actions for ${reviewTableName}`}>
-                <button type="button" onClick={() => { openReviewTable(activePane === "left" ? "right" : "left"); setOpenExplorerMenuId(null); }}>Open in other editor</button>
+                <button type="button" onClick={() => { openReviewTable(activePane === "left" ? "right" : "left"); setOpenExplorerMenuId(null); }}>Open in other pane</button>
                 <button type="button" onClick={() => { cancelDocumentRenameRef.current = false; setRenamingDocumentId(tableId); setRenamingDocumentValue(reviewTableName); setOpenExplorerMenuId(null); }}>Rename</button>
               </div> : null}
             </div>
@@ -3020,7 +3259,7 @@ function ReviewWorkspace({
                         }}
                       />
                     ) : (
-                      <button type="button" className="explorer-document-main" onClick={() => openDocument(activePane, entry.id)} title={`Open ${entry.name} in ${activePane === "left" ? "Editor 1" : "Editor 2"}`} aria-label={`Open ${entry.name} in ${activePane === "left" ? "Editor 1" : "Editor 2"}. Currently open in ${openEditorLabels(entry.id)}.${loaded ? "" : " File access needed."}`}>
+                      <button type="button" className="explorer-document-main" onClick={() => openDocument(activePane, entry.id)} title={`Open ${entry.name} in ${paneLabel(activePane)}`} aria-label={`Open ${entry.name} in ${paneLabel(activePane)}. Currently open in ${openPaneLabels(entry.id)}.${loaded ? "" : " File access needed."}`}>
                         <FileText size={17} aria-hidden="true" />
                         <span><strong title={entry.name}>{explorerDisplayName(entry.name)}</strong><small className={!loaded ? "needs-access" : ""} title={status?.message}>{loaded
                           ? status?.status === "error"
@@ -3029,10 +3268,6 @@ function ReviewWorkspace({
                               ? "Opening PDF..."
                               : `PDF · ${entry.pageCount ? `${entry.pageCount} pages · ` : ""}${formatFileSize(loaded.file.size)}`
                           : "Needs file access"}</small></span>
-                        <span className="explorer-pane-badges" aria-hidden="true">
-                          {tabs.left.activeId === entry.id ? <b>1</b> : null}
-                          {tabs.right.activeId === entry.id ? <b>2</b> : null}
-                        </span>
                       </button>
                     )}
                     <button
@@ -3048,7 +3283,7 @@ function ReviewWorkspace({
                     <FolderOpen size={13} aria-hidden="true" /> Select original PDF
                   </button> : null}
                   {openExplorerMenuId === entry.id ? <div data-explorer-actions className="explorer-document-menu" aria-label={`Actions for ${entry.name}`}>
-                    <button type="button" onClick={() => { openDocument(activePane === "left" ? "right" : "left", entry.id); setOpenExplorerMenuId(null); }}>Open in other editor</button>
+                    <button type="button" onClick={() => { openDocument(activePane === "left" ? "right" : "left", entry.id); setOpenExplorerMenuId(null); }}>Open in other pane</button>
                     <button type="button" onClick={() => { cancelDocumentRenameRef.current = false; setRenamingDocumentId(entry.id); setRenamingDocumentValue(entry.name); setOpenExplorerMenuId(null); }}>Rename</button>
                     <button type="button" onClick={() => { void openCatalogPicker(entry, activePane, true); setOpenExplorerMenuId(null); }}>Replace PDF</button>
                     <button type="button" disabled={index === 0} onClick={() => { setDocuments((current) => {
@@ -3127,18 +3362,20 @@ function ReviewWorkspace({
         {showTorPane && tabs.left.activeId === tableId ? renderReviewTable("left") : showTorPane ? (
           <DropPanel
             id="tor-panel"
-            title="Editor 1"
+            title="Left pane"
             tone="version-a"
             uploadedFile={files.left}
             missingDocument={documents.find((item) => item.id === tabs.left.activeId)?.name}
             onSelect={(selected) => void addDocuments(selected, "left")}
             onOpenDocumentDrop={(id) => openDocument("left", id)}
+            onMoveTabDrop={(from, id) => moveDocumentTab(from, "left", id)}
             toolbar={<EditorTabs
               slot="left"
               pane={tabs.left}
               documents={editorItems}
               onOpen={(id) => openDocument("left", id)}
               onClose={(id) => closeDocumentTab("left", id)}
+              onMove={(from, id) => moveDocumentTab(from, "left", id)}
               onAdd={() => void openCatalogPicker(undefined, "left")}
               onDownload={() => void downloadAnnotatedEvidence(files.left)}
             />}
@@ -3161,6 +3398,12 @@ function ReviewWorkspace({
                   : mark.fileName === files.left?.file.name,
               ),
               requirementNumbersByMarkId,
+              colorsByMarkId,
+              textPlacements: textPlacements.filter((placement) => placement.documentId === files.left?.id),
+              textPlacementTarget: activeTextRow ? { rowId: activeTextRow.mark.id, text: activeTextRow.mark.text } : null,
+              onPlaceText: files.left ? (page, x, y) => placeRequirementText(files.left!.id, page, x, y) : undefined,
+              onMoveTextPlacement: (id, x, y, scale) => setTextPlacements((current) => current.map((placement) => placement.id === id ? { ...placement, x, y, ...(scale === undefined ? {} : { scale }) } : placement)),
+              onRemoveTextPlacement: (id) => setTextPlacements((current) => current.filter((placement) => placement.id !== id)),
               onCreateMark: createEvidenceMark,
               onAutoPlaceMark: (id, labelPosition) =>
                 setMarks((current) =>
@@ -3213,13 +3456,14 @@ function ReviewWorkspace({
         {showEvidencePane && tabs.right.activeId === tableId ? renderReviewTable("right") : showEvidencePane ? (
           <DropPanel
             id="evidence-panel"
-            title="Editor 2"
+            title="Right pane"
             tone="version-b"
             multiple
             uploadedFile={files.right}
             missingDocument={documents.find((item) => item.id === tabs.right.activeId)?.name}
             onSelect={(selected) => void addDocuments(selected, "right")}
             onOpenDocumentDrop={(id) => openDocument("right", id)}
+            onMoveTabDrop={(from, id) => moveDocumentTab(from, "right", id)}
             previewProps={{
               side: "catalog",
               pendingLinkId,
@@ -3240,6 +3484,12 @@ function ReviewWorkspace({
               ),
               requirementNumberByLinkId,
               requirementNumbersByMarkId,
+              colorsByMarkId,
+              textPlacements: textPlacements.filter((placement) => placement.documentId === files.right?.id),
+              textPlacementTarget: activeTextRow ? { rowId: activeTextRow.mark.id, text: activeTextRow.mark.text } : null,
+              onPlaceText: files.right ? (page, x, y) => placeRequirementText(files.right!.id, page, x, y) : undefined,
+              onMoveTextPlacement: (id, x, y, scale) => setTextPlacements((current) => current.map((placement) => placement.id === id ? { ...placement, x, y, ...(scale === undefined ? {} : { scale }) } : placement)),
+              onRemoveTextPlacement: (id) => setTextPlacements((current) => current.filter((placement) => placement.id !== id)),
               onAutoPlaceMark: (id, labelPosition) =>
                 setMarks((current) =>
                   current.map((mark) =>
@@ -3262,6 +3512,7 @@ function ReviewWorkspace({
               documents={editorItems}
               onOpen={(id) => openDocument("right", id)}
               onClose={(id) => closeDocumentTab("right", id)}
+              onMove={(from, id) => moveDocumentTab(from, "right", id)}
               onAdd={() => void openCatalogPicker(undefined, "right")}
               onDownload={() => void downloadAnnotatedEvidence(files.right)}
             />}
@@ -3270,7 +3521,7 @@ function ReviewWorkspace({
         {!showTorPane && !showEvidencePane ? (
           <div className="workspace-empty-state" role="status">
             <strong>No document panes shown</strong>
-          <span>Use the Editor 1 or Editor 2 buttons in the toolbar to show a pane.</span>
+          <span>Use the pane buttons in the toolbar to show a document pane.</span>
           </div>
         ) : null}
       </section>

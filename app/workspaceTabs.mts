@@ -42,6 +42,11 @@ export function closeWorkspaceTab(tabs: WorkspaceTabs, slot: Slot, documentId: s
   };
 }
 
+export function moveWorkspaceTab(tabs: WorkspaceTabs, from: Slot, to: Slot, documentId: string): WorkspaceTabs {
+  if (from === to || !tabs[from].openIds.includes(documentId)) return tabs;
+  return openWorkspaceTab(closeWorkspaceTab(tabs, from, documentId), to, documentId);
+}
+
 export function removeWorkspaceDocumentTabs(tabs: WorkspaceTabs, documentId: string): WorkspaceTabs {
   return closeWorkspaceTab(closeWorkspaceTab(tabs, "left", documentId), "right", documentId);
 }

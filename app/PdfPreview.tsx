@@ -17,6 +17,8 @@ import type { PDFException, PDFSlickOptions } from "@pdfslick/core";
 import { createStore, PDFSlickViewer } from "@pdfslick/react";
 import { Highlighter, Link2, MessageSquare } from "lucide-react";
 import { selectionAction } from "./highlightIntent.mts";
+import { linkColorStyle, resolveLinkColor, type LinkColor } from "./linkColors.mts";
+import { anchoredRequirementTextPosition, clampRequirementTextPosition, clampRequirementTextScale, layoutRequirementText, resizedRequirementTextScale, type RequirementTextPlacement } from "./requirementText.mts";
 
 type AreaRect = { x: number; y: number; width: number; height: number };
 
@@ -87,6 +89,7 @@ export type EvidenceMark = {
   manual?: boolean;
   parentId?: string;
   requirementNo?: string;
+  color?: LinkColor;
 };
 
 export default function PdfPreview({
@@ -100,6 +103,12 @@ export default function PdfPreview({
   marks,
   requirementNumberByLinkId,
   requirementNumbersByMarkId,
+  colorsByMarkId,
+  textPlacements = [],
+  textPlacementTarget,
+  onPlaceText,
+  onMoveTextPlacement,
+  onRemoveTextPlacement,
   renderAnnotations = true,
   onMoveMark,
   onAutoPlaceMark,
@@ -119,6 +128,12 @@ export default function PdfPreview({
   marks: EvidenceMark[];
   requirementNumberByLinkId?: ReadonlyMap<string, string>;
   requirementNumbersByMarkId?: ReadonlyMap<string, readonly string[]>;
+  colorsByMarkId?: ReadonlyMap<string, readonly LinkColor[]>;
+  textPlacements?: RequirementTextPlacement[];
+  textPlacementTarget?: { rowId: string; text: string } | null;
+  onPlaceText?: (page: number, x: number, y: number) => boolean;
+  onMoveTextPlacement?: (id: string, x: number, y: number, scale?: number) => void;
+  onRemoveTextPlacement?: (id: string) => void;
   renderAnnotations?: boolean;
   onMoveMark?: (
     id: string,
@@ -133,6 +148,7 @@ export default function PdfPreview({
   onViewChange?: (view: { page: number; scale: number }) => void;
 }) {
   const initialViewRef = useRef(initialView);
+  const viewerNodeRef = useRef<HTMLElement | null>(null);
   const [container, setContainer] = useState<HTMLElement | null>(null);
   const [error, setError] = useState<PDFException | null>(null);
   const [isDocumentLoaded, setIsDocumentLoaded] = useState(false);
@@ -147,10 +163,19 @@ export default function PdfPreview({
   } | null>(null);
   const rangesRef = useRef(new Map<string, Range>());
   const areaJustFinishedRef = useRef(false);
+  const textPointerRef = useRef<{ pointerId: number; page: number; x: number; y: number; clientX: number; clientY: number } | null>(null);
+  const placingTextRef = useRef(false);
+  const keyboardStampFocusRef = useRef<string | null>(null);
 
   useEffect(() => {
     setSelection(null);
   }, [evidenceTargetRowId]);
+  useEffect(() => {
+    placingTextRef.current = false;
+    textPointerRef.current = null;
+    setSelection(null);
+    setAreaDraft(null);
+  }, [textPlacementTarget?.rowId]);
   const store = useMemo(() => create(), []);
   const usePDFSlickStore = useMemo(() => createStore(store), [store]);
   const options = useMemo<PDFSlickOptions>(
@@ -166,7 +191,10 @@ export default function PdfPreview({
     [file.name],
   );
   const viewerRef = useCallback((node: HTMLElement | null) => {
-    if (node) setContainer(node);
+    // PDFSlickViewer recreates its callback ref on render, including a transient null detach.
+    if (!node || viewerNodeRef.current === node) return;
+    viewerNodeRef.current = node;
+    setContainer(node);
   }, []);
   const numPages = usePDFSlickStore((state) => state.numPages);
   const pageNumber = usePDFSlickStore((state) => state.pageNumber);
@@ -191,7 +219,7 @@ export default function PdfPreview({
     const restoreHighlights = window.setTimeout(() => {
       container
         .querySelectorAll(
-          "[data-requirement-reference], [data-area-mark], [data-annotation-canvas], [data-annotation-badge-hit]",
+          "[data-requirement-reference], [data-area-mark], [data-annotation-canvas], [data-annotation-badge-hit], [data-requirement-text]",
         )
         .forEach((element) => element.remove());
 
@@ -245,8 +273,11 @@ export default function PdfPreview({
         }
         const { width, height } = page.getBoundingClientRect();
         const isAreaMark = Boolean(mark.area);
-        context.fillStyle = isAreaMark ? "rgb(59 130 246 / 23%)" : "rgb(59 130 246 / 32%)";
-        context.strokeStyle = "#3b82f6";
+        const colors = (colorsByMarkId?.get(mark.id)?.length
+          ? colorsByMarkId.get(mark.id)!
+          : [resolveLinkColor(mark.color)]).map(linkColorStyle);
+        const primaryColor = colors[0];
+        context.fillStyle = `rgb(${primaryColor.rgb.join(" ")} / ${isAreaMark ? "23%" : "32%"})`;
         context.lineWidth = isAreaMark ? 2 : 1.2;
         rects.forEach((rect) => {
           const x = rect.x * width;
@@ -254,16 +285,20 @@ export default function PdfPreview({
           const rectWidth = rect.width * width;
           const rectHeight = rect.height * height;
           context.fillRect(x, y, rectWidth, rectHeight);
-          if (isAreaMark) {
-            context.setLineDash([4, 3]);
-            context.strokeRect(x, y, rectWidth, rectHeight);
-            context.setLineDash([]);
-          } else {
-            context.beginPath();
-            context.moveTo(x, y + rectHeight);
-            context.lineTo(x + rectWidth, y + rectHeight);
-            context.stroke();
-          }
+          colors.forEach((color, index) => {
+            context.strokeStyle = color.fill;
+            if (isAreaMark) {
+              const inset = index * 3;
+              context.setLineDash([4, 3]);
+              context.strokeRect(x + inset, y + inset, Math.max(0, rectWidth - inset * 2), Math.max(0, rectHeight - inset * 2));
+              context.setLineDash([]);
+            } else {
+              context.beginPath();
+              context.moveTo(x, y + rectHeight - index * 2);
+              context.lineTo(x + rectWidth, y + rectHeight - index * 2);
+              context.stroke();
+            }
+          });
         });
         const requirementNo = requirementNumbersByMarkId?.get(mark.id)?.join(" · #") ??
           (mark.linkId ? requirementNumberByLinkId?.get(mark.linkId) : undefined);
@@ -327,11 +362,11 @@ export default function PdfPreview({
           context.beginPath();
           context.moveTo(connector.start.x, connector.start.y);
           context.lineTo(connector.end.x, connector.end.y);
-          context.strokeStyle = "#1d4ed8";
+          context.strokeStyle = primaryColor.badge;
           context.lineWidth = Math.max(1, width * 0.0014);
           context.stroke();
         }
-        context.fillStyle = "#1d4ed8";
+        context.fillStyle = primaryColor.badge;
         context.fillRect(x, y, labelWidth, labelHeight);
         context.fillStyle = "#eff6ff";
         context.fillText(label, x + paddingX, y + labelHeight - paddingY - fontSize * 0.16);
@@ -477,6 +512,246 @@ export default function PdfPreview({
         rangesRef.current.set(mark.id, range);
         drawAnnotation(mark, page as HTMLElement, mark.annotation?.rects ?? []);
       }
+      for (const placement of textPlacements) {
+        const page = container.querySelector<HTMLElement>(`.page[data-page-number="${placement.page}"]`);
+        if (!page) continue;
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (!context) continue;
+        const pageWidth = page.clientWidth || page.getBoundingClientRect().width;
+        const pageHeight = page.clientHeight || page.getBoundingClientRect().height;
+        const placementScale = placement.scale ?? 1;
+        const fontSize = pageWidth * 0.017 * placementScale;
+        context.font = `${fontSize}px Arial, sans-serif`;
+        let layout;
+        try {
+          layout = layoutRequirementText(
+            placement.text, pageWidth, pageHeight,
+            placement.x, placement.y, (value) => context.measureText(value).width,
+            placementScale,
+          );
+        } catch {
+          continue;
+        }
+        const stamp = document.createElement("div");
+        stamp.className = "requirement-text-stamp";
+        stamp.dataset.requirementText = placement.id;
+        stamp.style.left = `${layout.left}px`;
+        stamp.style.top = `${layout.top}px`;
+        stamp.style.width = `${layout.width}px`;
+        stamp.style.minHeight = `${layout.height}px`;
+        stamp.style.fontFamily = "Arial, sans-serif";
+        stamp.style.fontSize = `${layout.fontSize}px`;
+        stamp.style.lineHeight = `${layout.lineHeight}px`;
+        stamp.style.padding = `${layout.padding}px`;
+        stamp.dataset.scale = String(placementScale);
+        const content = document.createElement("span");
+        content.className = "requirement-text-content";
+        content.textContent = layout.lines.join("\n");
+        stamp.appendChild(content);
+        stamp.setAttribute("role", "group");
+        stamp.setAttribute("aria-label", `Placed requirement text on page ${placement.page}. Drag or use arrow keys to move it. Drag a corner handle or press Alt plus Up or Down to resize it. Press Delete to remove it.`);
+        stamp.tabIndex = 0;
+        const resizeHandles = (["nw", "ne", "sw", "se"] as const).map((corner) => {
+          const handle = document.createElement("span");
+          handle.className = `requirement-text-resize-handle ${corner}`;
+          handle.dataset.resizeCorner = corner;
+          handle.setAttribute("aria-hidden", "true");
+          stamp.appendChild(handle);
+          return { handle, corner };
+        });
+        page.appendChild(stamp);
+        if (onMoveTextPlacement) {
+          const drawLayout = (nextLayout: ReturnType<typeof layoutRequirementText>, nextScale: number) => {
+            stamp.style.left = `${nextLayout.left}px`;
+            stamp.style.top = `${nextLayout.top}px`;
+            stamp.style.width = `${nextLayout.width}px`;
+            stamp.style.minHeight = `${nextLayout.height}px`;
+            stamp.style.fontSize = `${nextLayout.fontSize}px`;
+            stamp.style.lineHeight = `${nextLayout.lineHeight}px`;
+            stamp.style.padding = `${nextLayout.padding}px`;
+            stamp.dataset.scale = String(nextScale);
+            content.textContent = nextLayout.lines.join("\n");
+          };
+          const sizedLayout = (nextScale: number, left: number, top: number) => {
+            context.font = `${pageWidth * 0.017 * nextScale}px Arial, sans-serif`;
+            return layoutRequirementText(
+              placement.text, pageWidth, pageHeight,
+              left / pageWidth, top / pageHeight,
+              (value) => context.measureText(value).width,
+              nextScale,
+            );
+          };
+          for (const { handle, corner } of resizeHandles) {
+            handle.addEventListener("pointerdown", (event) => {
+              if (event.button !== 0) return;
+              event.preventDefault();
+              event.stopPropagation();
+              stamp.setPointerCapture(event.pointerId);
+              stamp.classList.add("resizing");
+              const originalLeft = Number.parseFloat(stamp.style.left);
+              const originalTop = Number.parseFloat(stamp.style.top);
+              const originalWidth = stamp.offsetWidth;
+              const originalHeight = stamp.offsetHeight;
+              const originalScale = Number(stamp.dataset.scale) || 1;
+              const startX = event.clientX;
+              const startY = event.clientY;
+              const pageBounds = page.getBoundingClientRect();
+              const scaleX = pageBounds.width / pageWidth || 1;
+              const scaleY = pageBounds.height / pageHeight || 1;
+              let nextScale = originalScale;
+              let nextLayout = sizedLayout(originalScale, originalLeft, originalTop);
+              const move = (moveEvent: PointerEvent) => {
+                if (moveEvent.pointerId !== event.pointerId) return;
+                moveEvent.preventDefault();
+                moveEvent.stopPropagation();
+                const dx = (moveEvent.clientX - startX) / scaleX;
+                const dy = (moveEvent.clientY - startY) / scaleY;
+                const candidateScale = resizedRequirementTextScale(
+                  originalScale, dx, dy, originalWidth, originalHeight, corner,
+                );
+                try {
+                  const size = sizedLayout(candidateScale, 0, 0);
+                  const position = anchoredRequirementTextPosition(
+                    originalLeft, originalTop, originalWidth, originalHeight,
+                    size.width, size.height, pageWidth, pageHeight, corner,
+                  );
+                  nextLayout = sizedLayout(candidateScale, position.left, position.top);
+                  nextScale = candidateScale;
+                  drawLayout(nextLayout, nextScale);
+                } catch {
+                  // Keep the last fitting size when a larger layout would exceed the page.
+                }
+              };
+              const finish = (endEvent: PointerEvent) => {
+                if (endEvent.pointerId !== event.pointerId) return;
+                endEvent.preventDefault();
+                endEvent.stopPropagation();
+                stamp.classList.remove("resizing");
+                stamp.removeEventListener("pointermove", move);
+                stamp.removeEventListener("pointerup", finish);
+                stamp.removeEventListener("pointercancel", finish);
+                if (stamp.hasPointerCapture(event.pointerId)) stamp.releasePointerCapture(event.pointerId);
+                if (endEvent.type === "pointercancel") {
+                  drawLayout(sizedLayout(originalScale, originalLeft, originalTop), originalScale);
+                } else if (Math.abs(nextScale - originalScale) > 0.005) {
+                  onMoveTextPlacement(placement.id, nextLayout.left / pageWidth, nextLayout.top / pageHeight, nextScale);
+                }
+              };
+              stamp.addEventListener("pointermove", move);
+              stamp.addEventListener("pointerup", finish);
+              stamp.addEventListener("pointercancel", finish);
+            });
+          }
+          stamp.addEventListener("pointerdown", (event) => {
+            if (event.button !== 0 || (event.target as Element).closest("[data-resize-corner]")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            stamp.setPointerCapture(event.pointerId);
+            stamp.classList.add("dragging");
+            const startX = event.clientX;
+            const startY = event.clientY;
+            const originalLeft = Number.parseFloat(stamp.style.left);
+            const originalTop = Number.parseFloat(stamp.style.top);
+            const pageBounds = page.getBoundingClientRect();
+            const scaleX = pageBounds.width / pageWidth || 1;
+            const scaleY = pageBounds.height / pageHeight || 1;
+            let next = clampRequirementTextPosition(
+              originalLeft, originalTop, pageWidth, pageHeight,
+              stamp.offsetWidth, stamp.offsetHeight,
+            );
+            const move = (moveEvent: PointerEvent) => {
+              if (moveEvent.pointerId !== event.pointerId) return;
+              moveEvent.preventDefault();
+              moveEvent.stopPropagation();
+              next = clampRequirementTextPosition(
+                originalLeft + (moveEvent.clientX - startX) / scaleX,
+                originalTop + (moveEvent.clientY - startY) / scaleY,
+                pageWidth, pageHeight,
+                stamp.offsetWidth, stamp.offsetHeight,
+              );
+              stamp.style.left = `${next.left}px`;
+              stamp.style.top = `${next.top}px`;
+            };
+            const finish = (endEvent: PointerEvent) => {
+              if (endEvent.pointerId !== event.pointerId) return;
+              endEvent.preventDefault();
+              endEvent.stopPropagation();
+              stamp.classList.remove("dragging");
+              stamp.removeEventListener("pointermove", move);
+              stamp.removeEventListener("pointerup", finish);
+              stamp.removeEventListener("pointercancel", finish);
+              if (stamp.hasPointerCapture(event.pointerId)) stamp.releasePointerCapture(event.pointerId);
+              if (endEvent.type === "pointercancel") {
+                stamp.style.left = `${originalLeft}px`;
+                stamp.style.top = `${originalTop}px`;
+              } else if (Math.hypot(next.left - originalLeft, next.top - originalTop) >= 1) {
+                onMoveTextPlacement(placement.id, next.x, next.y);
+              }
+            };
+            stamp.addEventListener("pointermove", move);
+            stamp.addEventListener("pointerup", finish);
+            stamp.addEventListener("pointercancel", finish);
+          });
+          stamp.addEventListener("keydown", (event) => {
+            if (event.target !== stamp) return;
+            if ((event.key === "Delete" || event.key === "Backspace") && onRemoveTextPlacement) {
+              event.preventDefault();
+              event.stopPropagation();
+              onRemoveTextPlacement(placement.id);
+              return;
+            }
+            if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+              event.preventDefault();
+              event.stopPropagation();
+              const currentScale = Number(stamp.dataset.scale) || 1;
+              const step = event.shiftKey ? 0.25 : 0.1;
+              const nextScale = clampRequirementTextScale(currentScale + (event.key === "ArrowUp" ? step : -step));
+              if (nextScale === currentScale) return;
+              try {
+                const nextLayout = sizedLayout(
+                  nextScale,
+                  Number.parseFloat(stamp.style.left),
+                  Number.parseFloat(stamp.style.top),
+                );
+                drawLayout(nextLayout, nextScale);
+                keyboardStampFocusRef.current = placement.id;
+                onMoveTextPlacement(placement.id, nextLayout.left / pageWidth, nextLayout.top / pageHeight, nextScale);
+              } catch {
+                // Leave the current size in place when the text cannot fit on the page.
+              }
+              return;
+            }
+            const direction = {
+              ArrowLeft: [-1, 0],
+              ArrowRight: [1, 0],
+              ArrowUp: [0, -1],
+              ArrowDown: [0, 1],
+            }[event.key];
+            if (!direction) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const step = event.shiftKey ? 10 : 2;
+            const next = clampRequirementTextPosition(
+              Number.parseFloat(stamp.style.left) + direction[0] * step,
+              Number.parseFloat(stamp.style.top) + direction[1] * step,
+              pageWidth, pageHeight,
+              stamp.offsetWidth, stamp.offsetHeight,
+            );
+            stamp.style.left = `${next.left}px`;
+            stamp.style.top = `${next.top}px`;
+            keyboardStampFocusRef.current = placement.id;
+            onMoveTextPlacement(placement.id, next.x, next.y);
+          });
+        }
+        if (keyboardStampFocusRef.current === placement.id) {
+          stamp.focus();
+          keyboardStampFocusRef.current = null;
+        }
+      }
+      for (const placement of textPlacements) {
+        window.dispatchEvent(new CustomEvent("comparex:placement-ready", { detail: { id: placement.id, side } }));
+      }
       for (const mark of marks) {
         // A target page may be virtualized and not have a text range yet. The
         // caller can safely navigate as soon as this document is ready; the
@@ -488,7 +763,7 @@ export default function PdfPreview({
     }, 100);
 
     return () => window.clearTimeout(restoreHighlights);
-  }, [container, isDocumentLoaded, marks, onAutoPlaceMark, onMoveMark, renderAnnotations, requirementNumberByLinkId, requirementNumbersByMarkId, scale, side]);
+  }, [colorsByMarkId, container, isDocumentLoaded, marks, onAutoPlaceMark, onMoveMark, onMoveTextPlacement, onRemoveTextPlacement, pageNumber, renderAnnotations, requirementNumberByLinkId, requirementNumbersByMarkId, scale, side, textPlacements]);
 
   const commitMark = (
     candidate: MarkSelection,
@@ -542,6 +817,7 @@ export default function PdfPreview({
   };
 
   const captureSelection = () => {
+    if (textPlacementTarget) return;
     if (areaJustFinishedRef.current) {
       areaJustFinishedRef.current = false;
       return;
@@ -588,6 +864,7 @@ export default function PdfPreview({
   };
 
   const startAreaSelection = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (textPlacementTarget) return;
     if (event.button !== 0) return;
     const target = event.target as Element;
     const page = target.closest<HTMLElement>(".page");
@@ -648,6 +925,49 @@ export default function PdfPreview({
       commitSelectionOrShowToolbar(nextSelection);
     }
     setAreaDraft(null);
+  };
+
+  const placeTextAt = (pageNumberToPlace: number, x: number, y: number) => {
+    if (!textPlacementTarget || !container || !onPlaceText) return false;
+    const page = container.querySelector<HTMLElement>(`.page[data-page-number="${pageNumberToPlace}"]`);
+    if (!page) return false;
+    const { width, height } = page.getBoundingClientRect();
+    const context = document.createElement("canvas").getContext("2d");
+    if (!context) return false;
+    context.font = `${width * 0.017}px Arial, sans-serif`;
+    try {
+      layoutRequirementText(textPlacementTarget.text, width, height, x, y, (value) => context.measureText(value).width);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not place this text on the PDF page.");
+      return false;
+    }
+    return onPlaceText(pageNumberToPlace, x, y);
+  };
+
+  const startTextPlacement = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!textPlacementTarget || event.button !== 0 || placingTextRef.current) return;
+    const target = event.target as Element;
+    if (target.closest("button, a, input, [data-annotation-badge-hit], [data-requirement-text]")) return;
+    const page = target.closest<HTMLElement>(".page");
+    if (!page || !container?.contains(page)) return;
+    const bounds = page.getBoundingClientRect();
+    textPointerRef.current = {
+      pointerId: event.pointerId,
+      page: Number(page.dataset.pageNumber) || pageNumber,
+      x: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+      y: Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
+      clientX: event.clientX,
+      clientY: event.clientY,
+    };
+  };
+
+  const finishTextPlacement = (event: React.PointerEvent<HTMLDivElement>) => {
+    const candidate = textPointerRef.current;
+    textPointerRef.current = null;
+    if (!textPlacementTarget || !candidate || candidate.pointerId !== event.pointerId || placingTextRef.current) return;
+    if (Math.hypot(event.clientX - candidate.clientX, event.clientY - candidate.clientY) > 5) return;
+    placingTextRef.current = true;
+    if (!placeTextAt(candidate.page, candidate.x, candidate.y)) placingTextRef.current = false;
   };
 
   useEffect(() => {
@@ -718,6 +1038,36 @@ export default function PdfPreview({
   }, [container, marks, pdfSlick]);
 
   useEffect(() => {
+    if (!container || !pdfSlick) return;
+    const jumpToPlacement = (event: Event) => {
+      const { id, side: targetSide } = (event as CustomEvent<{ id: string; side: "tor" | "catalog" }>).detail;
+      if (targetSide !== side) return;
+      const placement = textPlacements.find((item) => item.id === id);
+      if (!placement) return;
+      pdfSlick.gotoPage(placement.page);
+      const selector = `[data-requirement-text="${CSS.escape(id)}"]`;
+      const reveal = () => {
+        const stamp = container.querySelector<HTMLElement>(selector);
+        if (!stamp) return false;
+        stamp.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+        return true;
+      };
+      if (reveal()) return;
+      const observer = new MutationObserver(() => {
+        if (reveal()) observer.disconnect();
+      });
+      observer.observe(container, { childList: true, subtree: true });
+      window.setTimeout(() => {
+        observer.disconnect();
+        if (!reveal()) container.querySelector<HTMLElement>(`.page[data-page-number="${placement.page}"]`)
+          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 2000);
+    };
+    window.addEventListener("comparex:jump-to-placement", jumpToPlacement);
+    return () => window.removeEventListener("comparex:jump-to-placement", jumpToPlacement);
+  }, [container, pdfSlick, side, textPlacements]);
+
+  useEffect(() => {
     const removeMark = (event: Event) => {
       const id = (event as CustomEvent<string>).detail;
       container?.querySelector(`[data-area-mark="${id}"]`)?.remove();
@@ -733,13 +1083,13 @@ export default function PdfPreview({
 
   return (
     <div
-      className="pdf-preview pdfSlick"
+      className={`pdf-preview pdfSlick ${textPlacementTarget ? "placing-requirement-text" : ""}`}
       onClick={(event) => event.stopPropagation()}
       onMouseUp={captureSelection}
-      onPointerDown={startAreaSelection}
+      onPointerDown={(event) => { startTextPlacement(event); startAreaSelection(event); }}
       onPointerMove={moveAreaSelection}
-      onPointerUp={finishAreaSelection}
-      onPointerCancel={() => setAreaDraft(null)}
+      onPointerUp={(event) => { finishTextPlacement(event); finishAreaSelection(event); }}
+      onPointerCancel={() => { textPointerRef.current = null; setAreaDraft(null); }}
     >
       <style>{`
         ::highlight(comparex-tor) {
@@ -820,6 +1170,16 @@ export default function PdfPreview({
         >
           +
         </button>
+        {textPlacementTarget ? (
+          <button
+            type="button"
+            onClick={() => placeTextAt(pageNumber, 0.5, 0.5)}
+            disabled={!isDocumentLoaded}
+            aria-label="Place selected requirement text at the center of this PDF page"
+          >
+            Place text at center
+          </button>
+        ) : null}
       </div>
 
       <div className="pdf-canvas-wrap">
