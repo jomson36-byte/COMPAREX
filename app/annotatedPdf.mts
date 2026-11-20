@@ -205,7 +205,7 @@ async function drawRequirementText(
   canvas.width = Math.ceil(layout.width * ratio);
   canvas.height = Math.ceil(layout.height * ratio);
   context.scale(ratio, ratio);
-  context.fillStyle = "#111827";
+  context.fillStyle = "#DC2626";
   context.font = `${layout.fontSize}px Arial, sans-serif`;
   context.textBaseline = "alphabetic";
   layout.lines.forEach((line, index) => {

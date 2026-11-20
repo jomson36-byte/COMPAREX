@@ -41,6 +41,7 @@ async function withCanvas(callback) {
   const renderedLabels = [];
   const paintedBackgrounds = [];
   const renderedFonts = [];
+  const renderedColors = [];
   globalThis.document = {
     createElement: (tag) => {
       assert.equal(tag, "canvas");
@@ -50,7 +51,11 @@ async function withCanvas(callback) {
           scale: () => {},
           fillRect: (...args) => paintedBackgrounds.push(["fill", ...args]),
           strokeRect: (...args) => paintedBackgrounds.push(["stroke", ...args]),
-          fillText(text) { renderedLabels.push(text); renderedFonts.push(this.font); },
+          fillText(text) {
+            renderedLabels.push(text);
+            renderedFonts.push(this.font);
+            renderedColors.push(this.fillStyle);
+          },
         }),
         toDataURL: () => transparentPng,
       };
@@ -58,7 +63,7 @@ async function withCanvas(callback) {
   };
 
   try {
-    return await callback(renderedLabels, paintedBackgrounds, renderedFonts);
+    return await callback(renderedLabels, paintedBackgrounds, renderedFonts, renderedColors);
   } finally {
     if (originalDocument === undefined) delete globalThis.document;
     else globalThis.document = originalDocument;
@@ -97,8 +102,8 @@ test("exports a shared highlight with independently colored links", async () => 
   });
 });
 
-test("exports placed Thai Requirement text without a background or frame", async () => {
-  await withCanvas(async (renderedText, paintedBackgrounds) => {
+test("exports placed Thai Requirement text in red without a background or frame", async () => {
+  await withCanvas(async (renderedText, paintedBackgrounds, _, renderedColors) => {
     const output = await createAnnotatedPdf(
       await makeSourceFile(),
       [],
@@ -107,6 +112,7 @@ test("exports placed Thai Requirement text without a background or frame", async
     );
     assert.deepEqual(renderedText, ["ลำโพง 12 นิ้ว"]);
     assert.deepEqual(paintedBackgrounds, []);
+    assert.deepEqual(renderedColors, ["#DC2626"]);
     assert.equal((await PDFDocument.load(await output.arrayBuffer())).getPageCount(), 1);
   });
 });

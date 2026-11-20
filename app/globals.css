@@ -1205,7 +1205,7 @@ button:disabled {
 .requirement-text-stamp {
   position: absolute;
   z-index: 14;
-  color: #111827;
+  color: #DC2626;
   background: transparent;
   white-space: pre;
   overflow-wrap: normal;
